@@ -32,7 +32,7 @@
 | `main` | 上游同步镜像 | 只同步 `baibai-git/baibaoku:main`，不放个人 Runtime 改动 |
 | `personal/stable` | NAS 生产分支 | 唯一允许部署到 NAS 的分支；更新前必须完成兼容审查和测试 |
 
-`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建，初始Runtime基线为 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`。新增 Runbook、AGENTS 和 README 后，个人 `personal/stable` 当前HEAD为 `ec375fdf2cce3ea0d519cbf698ce365778a8b9b8`；相对初始基线的提交仅修改 `AGENTS.md`、`README.md` 和 `docs/PERSONAL_MAINTENANCE.md`，Runtime仍与上游等价。NAS尚未安装此分支。
+`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建，初始Runtime基线为 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`。随后新增的 Runbook、AGENTS 和 README 都是文档变更；相对初始基线的差异仅限 `AGENTS.md`、`README.md` 和 `docs/PERSONAL_MAINTENANCE.md`，Runtime仍与上游等价。NAS尚未安装此分支；后续维护时应实时读取GitHub远端HEAD，不要把历史SHA当成当前分支头。
 
 ### 上游更新流程
 
