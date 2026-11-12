@@ -16,6 +16,7 @@
 | Server Plugin 开关 | `enableServerPlugins: true` |
 | Server Plugin 自动更新 | `enableServerPluginsAutoUpdate: false` |
 | NAS 当前 Git HEAD | `4814830f2d161dfff89e75370effa31d669586d9`（personal/stable） |
+| GitHub origin/personal/stable | `c6037030a6459feb58c7f004723bd1718f7aab74`（比NAS多1个文档提交） |
 | NAS Runtime 基线 | `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`（0.7.3；后续差异仅文档） |
 | NAS 当前 Git 状态 | `personal/stable`，跟踪 `origin/personal/stable`，工作区干净 |
 | NAS 当前 origin | `https://github.com/SurgeXW0508/baibaoku.git`（个人 Fork） |
