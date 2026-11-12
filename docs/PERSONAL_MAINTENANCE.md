@@ -16,7 +16,7 @@
 | Server Plugin 开关 | `enableServerPlugins: true` |
 | Server Plugin 自动更新 | `enableServerPluginsAutoUpdate: false` |
 | NAS 当前 Git HEAD | `4814830f2d161dfff89e75370effa31d669586d9`（personal/stable） |
-| GitHub origin/personal/stable | `c6037030a6459feb58c7f004723bd1718f7aab74`（比NAS多1个文档提交） |
+| GitHub origin/personal/stable | 每次更新前先 fetch 并读取实时 HEAD；不要依赖文档中记录的历史 SHA |
 | NAS Runtime 基线 | `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`（0.7.3；后续差异仅文档） |
 | NAS 当前 Git 状态 | `personal/stable`，跟踪 `origin/personal/stable`，工作区干净 |
 | NAS 当前 origin | `https://github.com/SurgeXW0508/baibaoku.git`（个人 Fork） |
@@ -62,7 +62,7 @@
 - 备份分支 → `backup/pre-personal-stable-20261112`，保留原始 Runtime 基线 `b211a4e9`。
 - 本地 `main` 仍跟踪 `upstream/main`，落后 4 个提交；它不是生产分支，不影响当前部署。
 
-本次只改变 Git remote、分支和检出的文档版本。生产 Runtime 与原 `b211a4e9` 完全相同；没有安装依赖、修改数据库、重启或重新构建 Docker。原有数据库和插件配置均未触碰。
+本次只改变 Git remote、分支和检出的文档版本。生产 Runtime 与原 `b211a4e9` 完全相同；没有安装依赖、修改数据库、重启或重新构建 Docker。原有数据库和插件配置均未触碰。 当前 GitHub `origin/personal/stable` 还包含 NAS 本地 HEAD 之后的维护文档提交；这些差异仅涉及本 Runbook，不涉及 Runtime。任何后续更新前先 fetch 并审查实际差异。
 
 ## 4. 日常 NAS 更新（当前分支关系已就绪）
 
