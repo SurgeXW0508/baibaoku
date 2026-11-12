@@ -15,9 +15,13 @@
 | Docker 挂载 | 宿主机 `plugins` 目录挂载到 `/home/node/app/plugins`，读写 |
 | Server Plugin 开关 | `enableServerPlugins: true` |
 | Server Plugin 自动更新 | `enableServerPluginsAutoUpdate: false` |
-| NAS 当前 HEAD | `b211a4e97fdaec24dc8b90c85ddc198fac9ac200` |
-| NAS 当前 Git 状态 | detached HEAD，工作区干净 |
-| NAS 当前 origin | `https://github.com/baibai-git/baibaoku.git`（仍指向原作者） |
+| NAS 当前 Git HEAD | `4814830f2d161dfff89e75370effa31d669586d9`（personal/stable） |
+| NAS Runtime 基线 | `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`（0.7.3；后续差异仅文档） |
+| NAS 当前 Git 状态 | `personal/stable`，跟踪 `origin/personal/stable`，工作区干净 |
+| NAS 当前 origin | `https://github.com/SurgeXW0508/baibaoku.git`（个人 Fork） |
+| NAS 当前 upstream | `https://github.com/baibai-git/baibaoku.git`（原作者） |
+| 本地备份分支 | `backup/pre-personal-stable-20261112`，指向原 Runtime 基线 |
+| 本地 main | 跟踪 `upstream/main`，当前落后 4 个提交；不参与生产部署 |
 
 因此，更新柏宝库的 Git 文件不会要求重新构建 SillyTavern Docker 镜像；但 Server Plugin 已在 Node 进程启动时加载，更新后必须重启 SillyTavern 容器，并刷新浏览器页面。
 
@@ -32,7 +36,7 @@
 | `main` | 上游同步镜像 | 只同步 `baibai-git/baibaoku:main`，不放个人 Runtime 改动 |
 | `personal/stable` | NAS 生产分支 | 唯一允许部署到 NAS 的分支；更新前必须完成兼容审查和测试 |
 
-`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建，初始Runtime基线为 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`。随后新增的 Runbook、AGENTS 和 README 都是文档变更；相对初始基线的差异仅限 `AGENTS.md`、`README.md` 和 `docs/PERSONAL_MAINTENANCE.md`，Runtime仍与上游等价。NAS尚未安装此分支；后续维护时应实时读取GitHub远端HEAD，不要把历史SHA当成当前分支头。
+`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建，初始Runtime基线为 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`。随后新增的 Runbook、AGENTS 和 README 都是文档变更；相对初始基线的差异仅限 `AGENTS.md`、`README.md` 和 `docs/PERSONAL_MAINTENANCE.md`，Runtime仍与上游等价。2026-11-12 已完成 NAS 一次性切换，当前Git HEAD为 `4814830f2d161dfff89e75370effa31d669586d9`；本次仅切换 remote/branch 元数据并检出文档提交，没有更新 Runtime 文件或重启容器。
 
 ### 上游更新流程
 
@@ -43,21 +47,23 @@
 5. 审查通过后，将变更以可快进方式推进到 `personal/stable`。不要 force-push、rebase 或重写已经公开并被 NAS 跟踪的 stable 历史。
 6. 只有用户明确决定部署时，才更新 NAS。
 
-## 3. NAS 一次性分支整理（尚未执行）
+## 3. NAS 一次性分支整理（已完成）
 
-截至 2026-11-12，NAS 仍是原作者 origin + detached HEAD。个人 Fork 已建立 `main` 和 `personal/stable`，但**NAS 尚未切换到个人 Fork**。
+2026-11-12 已通过 NAS SSH 完成一次性 Git 跟踪关系整理。执行前确认：HEAD 为 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`、工作区干净、原 origin 为原作者仓库，且个人 Fork 的 `personal/stable` 相对该基线只有维护文档差异。
 
-在首次切换前，必须重新只读核验 NAS 插件目录的 remote、所有本地分支、HEAD、工作区、是否存在额外 remote，以及 GitHub `personal/stable` 的实时 HEAD。确认无本地改动且远端基线兼容后，才单独执行一次性整理：
+完成后的实际状态：
 
-- 保留原作者仓库为上游参考（例如 remote `upstream`）。
-- 将 `origin` 指向 `SurgeXW0508/baibaoku`。
-- 建立本地 `personal/stable` 并跟踪 `origin/personal/stable`。
-- 不删除数据库、不重装插件、不更改 `config.yaml`，不重新构建 Docker。
-- 完成后核对 `git status`、当前分支、origin、upstream 和 HEAD，并通过状态 API 验证插件仍正常。
+- `origin` → `https://github.com/SurgeXW0508/baibaoku.git`。
+- `upstream` → `https://github.com/baibai-git/baibaoku.git`。
+- 当前分支 → `personal/stable`，跟踪 `origin/personal/stable`。
+- 当前 HEAD → `4814830f2d161dfff89e75370effa31d669586d9`。
+- 工作区 → clean。
+- 备份分支 → `backup/pre-personal-stable-20261112`，保留原始 Runtime 基线 `b211a4e9`。
+- 本地 `main` 仍跟踪 `upstream/main`，落后 4 个提交；它不是生产分支，不影响当前部署。
 
-这是一项单独授权的一次性 NAS 操作。不要把它混入普通代码审查或上游同步任务，也不要在未核对现场时直接复制远端命令。
+本次只改变 Git remote、分支和检出的文档版本。生产 Runtime 与原 `b211a4e9` 完全相同；没有安装依赖、修改数据库、重启或重新构建 Docker。原有数据库和插件配置均未触碰。
 
-## 4. 日常 NAS 更新（完成一次性整理后）
+## 4. 日常 NAS 更新（当前分支关系已就绪）
 
 日常更新尽量通过飞牛 OS Docker 图形界面，不再 SSH 登录 NAS。
 
