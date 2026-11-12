@@ -104,6 +104,8 @@ globalThis.__baibaokuRegexBridge?.beforeScript?.(script, finalString, context)
 - [API 文档](docs/api.md)
 - [前端调用示例](docs/sdk.md)
 - [使用场景示例](docs/examples.md)
+- [Personal Fork 维护与 NAS 更新](docs/PERSONAL_MAINTENANCE.md)
+- [SillyTavern Personal 能力归属与兼容规范](https://github.com/SurgeXW0508/SillyTavern/blob/release/docs/personal-fork/MAINTENANCE_COMPATIBILITY.md)
 
 ## 安全边界
 
