@@ -36,52 +36,60 @@ export function installWorldInfoTokenizerBridge() {
     }
 }
 
-export function patchWorldInfoJs(source) {
+export function unpatchWorldInfoJs(source) {
     const newline = source.includes('\r\n') ? '\r\n' : '\n';
-    const cleanedSource = source.replace(BRIDGE_BLOCK_PATTERN, '');
     const originalAnchor = [
         '        let newContent = \'\';',
         '        const textToScanTokens = await getTokenCountAsync(allActivatedText);',
         '',
         '        filterByInclusionGroups(newEntries, allActivatedEntries, buffer, scanState, timedEffects);',
     ].join(newline);
-    const reentrantAnchor = [
+    const legacyReorderedAnchor = [
         '        let newContent = \'\';',
         '',
         '        filterByInclusionGroups(newEntries, allActivatedEntries, buffer, scanState, timedEffects);',
         '',
         '        const textToScanTokens = await getTokenCountAsync(allActivatedText);',
     ].join(newline);
-    const anchor = cleanedSource.includes(originalAnchor)
-        ? originalAnchor
-        : cleanedSource.includes(reentrantAnchor)
-            ? reentrantAnchor
-            : '';
+
+    return source
+        .replace(BRIDGE_BLOCK_PATTERN, '')
+        .replace(legacyReorderedAnchor, originalAnchor)
+        .replace(
+            '            entry.content = baibaokuWorldInfoBudgetContent.get(entry) ?? substituteParams(entry.content);',
+            '            entry.content = substituteParams(entry.content);',
+        );
+}
+
+export function patchWorldInfoJs(source) {
+    const newline = source.includes('\r\n') ? '\r\n' : '\n';
+    const cleanedSource = unpatchWorldInfoJs(source);
+    const anchor = [
+        '        let newContent = \'\';',
+        '        const textToScanTokens = await getTokenCountAsync(allActivatedText);',
+        '',
+        '        filterByInclusionGroups(newEntries, allActivatedEntries, buffer, scanState, timedEffects);',
+    ].join(newline);
 
     if (!cleanedSource.includes('export async function getWorldInfoPrompt')
         || !cleanedSource.includes('async function checkWorldInfo')
-        || !anchor) {
+        || !cleanedSource.includes(anchor)) {
         return hasWorldInfoTokenizerBridge(source) ? source : cleanedSource;
     }
 
-    const replacement = [
-        '        let newContent = \'\';',
-        '',
-        '        filterByInclusionGroups(newEntries, allActivatedEntries, buffer, scanState, timedEffects);',
-        '',
+    const bridgeBlock = [
         `        ${BEGIN_MARKER}`,
-        '        const baibaokuWorldInfoBudgetContent = new WeakMap();',
         '        const baibaokuWorldInfoTokenizerBridge = globalThis.__baibaokuTokenizerBulkBridge;',
         '        if (typeof baibaokuWorldInfoTokenizerBridge?.prepareWorldInfoBudgetCounts === \'function\'',
         '            && baibaokuWorldInfoTokenizerBridge?.isEnabled?.() !== false) {',
         '            await Promise.resolve(baibaokuWorldInfoTokenizerBridge.prepareWorldInfoBudgetCounts({',
         '                version: 1,',
-        '                textToScan: allActivatedText,',
+        '                textToScan: \'\',',
         '                entries: newEntries.map(entry => {',
-        '                    const content = substituteParams(entry?.content ?? \'\');',
-        '                    baibaokuWorldInfoBudgetContent.set(entry, content);',
+        '                    const content = typeof entry?.content === \'string\' ? entry.content : \'\';',
         '                    return {',
         '                        content,',
+        '                        hasMacros: content.includes(\'{{\') || /<(?:USER|CHAR|BOT)>/i.test(content),',
         '                        ignoreBudget: Boolean(entry?.ignoreBudget),',
         '                        maySkip: Boolean(entry?.useProbability && entry?.probability !== 100 && !timedEffects.isEffectActive(\'sticky\', entry)),',
         '                    };',
@@ -89,15 +97,9 @@ export function patchWorldInfoJs(source) {
         "            })).catch(error => console.debug('[baibaoku] World Info tokenizer bridge prepare failed', error));",
         '        }',
         `        ${END_MARKER}`,
-        '        const textToScanTokens = await getTokenCountAsync(allActivatedText);',
     ].join(newline);
 
-    return cleanedSource
-        .replace(anchor, replacement)
-        .replace(
-            '            entry.content = substituteParams(entry.content);',
-            '            entry.content = baibaokuWorldInfoBudgetContent.get(entry) ?? substituteParams(entry.content);',
-        );
+    return cleanedSource.replace(anchor, `${anchor}${newline}${bridgeBlock}`);
 }
 
 function getWorldInfoPath() {

@@ -4748,7 +4748,7 @@ function makeEarlyBridgeScript(options = {}) {
  * @param {object} msg - Single message object
  * @returns {Promise<number>} Token count for this message
  */
-async function countSingleMessageBulk(model, resolvedModel, msg) {
+export async function countSingleMessageBulk(model, resolvedModel, msg) {
     // 1. WebTokenizer models (claude, llama3, deepseek, qwen2, command-r/a, nemo)
     const webTokenizer = getWebTokenizer(resolvedModel);
     if (webTokenizer) {
@@ -4769,11 +4769,17 @@ async function countSingleMessageBulk(model, resolvedModel, msg) {
     const tokensPadding = 3;
     const tokenizer = getTiktokenTokenizer(resolvedModel);
 
-    let count = tokensPerMessage + tokensPadding;
-    for (const [key, value] of Object.entries(msg)) {
-        count += tokenizer.encode(String(value ?? '')).length;
-        if (key === 'name') count += tokensPerName;
+    let count = 0;
+    try {
+        count += tokensPerMessage;
+        for (const [key, value] of Object.entries(msg)) {
+            count += tokenizer.encode(value).length;
+            if (key === 'name') count += tokensPerName;
+        }
+    } catch {
+        // Non-string fields (e.g. multimodal arrays or tool_calls) follow ST native behavior.
     }
+    count += tokensPadding;
     if (model.includes('gpt-3.5-turbo-0301')) count += 9;
     return count;
 }

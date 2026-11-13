@@ -36,9 +36,13 @@ export function installOpenAITokenizerBridge() {
     }
 }
 
+export function unpatchOpenAIJs(source) {
+    return source.replace(BRIDGE_BLOCK_PATTERN, '');
+}
+
 export function patchOpenAIJs(source) {
     const newline = source.includes('\r\n') ? '\r\n' : '\n';
-    const cleanedSource = source.replace(BRIDGE_BLOCK_PATTERN, '');
+    const cleanedSource = unpatchOpenAIJs(source);
     const anchor = `${newline}        // Fill the chat completion with as much context as the budget allows`;
 
     if (!cleanedSource.includes('export async function prepareOpenAIMessages')
@@ -49,24 +53,26 @@ export function patchOpenAIJs(source) {
 
     const bridgeBlock = [
         `        ${BEGIN_MARKER}`,
-        '        await Promise.resolve(globalThis.__baibaokuTokenizerBulkBridge?.prepareOpenAIMessages?.({',
-        '            version: 1,',
-        '            dryRun,',
-        '            prompts,',
-        '            promptManager,',
-        '            oaiSettings: oai_settings,',
-        '            selectedGroup: selected_group,',
-        '            bias,',
-        '            quietPrompt,',
-        '            quietImage,',
-        '            type,',
-        '            cyclePrompt,',
-        '            messages,',
-        '            messageExamples,',
-        '            newChatContent: substituteParams(selected_group ? oai_settings.new_group_chat_prompt : oai_settings.new_chat_prompt),',
-        '            sendIfEmpty: oai_settings.send_if_empty,',
-        '            newExampleChatContent: substituteParams(oai_settings.new_example_chat_prompt),',
-        "        })).catch(error => console.debug('[baibaoku] OpenAI tokenizer bridge prepare failed', error));",
+        '        if (globalThis.__baibaokuTokenizerBulkBridge?.isEnabled?.() !== false) {',
+        '            await Promise.resolve(globalThis.__baibaokuTokenizerBulkBridge?.prepareOpenAIMessages?.({',
+        '                version: 1,',
+        '                dryRun,',
+        '                prompts,',
+        '                promptManager,',
+        '                oaiSettings: oai_settings,',
+        '                selectedGroup: selected_group,',
+        '                bias,',
+        '                quietPrompt,',
+        '                quietImage,',
+        '                type,',
+        '                cyclePrompt,',
+        '                messages,',
+        '                messageExamples,',
+        '                newChatContent: selected_group ? oai_settings.new_group_chat_prompt : oai_settings.new_chat_prompt,',
+        '                sendIfEmpty: oai_settings.send_if_empty,',
+        '                newExampleChatContent: oai_settings.new_example_chat_prompt,',
+        "            })).catch(error => console.debug('[baibaoku] OpenAI tokenizer bridge prepare failed', error));",
+        '        }',
         `        ${END_MARKER}`,
     ].join(newline) + newline;
 
