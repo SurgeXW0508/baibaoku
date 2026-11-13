@@ -27,6 +27,68 @@ export function isSafeBranchName(name) {
         && !/[\s~^:?*[\\\x00-\x1f\x7f]/.test(name);
 }
 
+function toConfigList(input) {
+    if (Array.isArray(input)) {
+        return input
+            .filter(item => item !== undefined && item !== null)
+            .map(item => String(item).trim());
+    }
+    if (typeof input === 'string' && input.trim()) {
+        return [input.trim()];
+    }
+    return [];
+}
+
+// 完整核验 branch.<name>.remote 与 branch.<name>.merge:扩展更新固定走 origin,拒绝残缺配置或指向其它远端的跟踪关系
+export function parseBranchUpstreamConfig(remoteValues, mergeValues) {
+    const remotes = toConfigList(remoteValues);
+    const merges = toConfigList(mergeValues);
+    if (remotes.length === 0 && merges.length === 0) {
+        return { state: 'none', remote: null, branch: null, target: null };
+    }
+    if (remotes.length !== 1 || merges.length !== 1 || !remotes[0] || !merges[0]) {
+        if (remotes.length === 1 && remotes[0] && remotes[0] !== 'origin' && remotes[0] !== '.') {
+            return { state: 'non-origin', remote: remotes[0], branch: null, target: remotes[0] };
+        }
+        return { state: 'incomplete', remote: remotes[0] || null, branch: null, target: merges[0] || remotes[0] || null };
+    }
+    const remote = remotes[0];
+    const merge = merges[0];
+    if (remote === 'origin') {
+        if (merge.startsWith('refs/heads/')) {
+            const branch = merge.slice('refs/heads/'.length);
+            if (isSafeBranchName(branch)) {
+                return { state: 'origin', remote: 'origin', branch, target: `origin/${branch}` };
+            }
+        }
+        return { state: 'incomplete', remote: 'origin', branch: null, target: `origin:${merge}` };
+    }
+    if (remote === '.') {
+        if (merge.startsWith('refs/remotes/origin/')) {
+            const branch = merge.slice('refs/remotes/origin/'.length);
+            if (isSafeBranchName(branch)) {
+                return { state: 'origin', remote: 'origin', branch, target: `origin/${branch}` };
+            }
+            return { state: 'incomplete', remote: '.', branch: null, target: merge };
+        }
+        if (merge.startsWith('refs/remotes/')) {
+            const target = merge.slice('refs/remotes/'.length);
+            const slash = target.indexOf('/');
+            return {
+                state: 'non-origin',
+                remote: slash > 0 ? target.slice(0, slash) : '.',
+                branch: null,
+                target,
+            };
+        }
+        const localTarget = merge.startsWith('refs/heads/') ? merge.slice('refs/heads/'.length) : merge;
+        return { state: 'non-origin', remote: '.', branch: null, target: localTarget };
+    }
+    const remoteBranch = merge.startsWith('refs/heads/') ? merge.slice('refs/heads/'.length) : null;
+    const target = remoteBranch ? `${remote}/${remoteBranch}` : `${remote}:${merge}`;
+    return { state: 'non-origin', remote, branch: null, target };
+}
+
 function local(dir, args, options = {}) {
     return runGit(args, { repoDir: dir, cwd: dir, timeoutMs: LOCAL_TIMEOUT_MS, ...options });
 }
@@ -34,6 +96,14 @@ function local(dir, args, options = {}) {
 async function localText(dir, args) {
     const result = await local(dir, args);
     return result.code === 0 ? result.stdout.trim() : '';
+}
+
+async function localConfigAll(dir, key) {
+    const result = await local(dir, ['config', '--get-all', key]);
+    if (result.code !== 0) {
+        return [];
+    }
+    return result.stdout.replace(/\r?\n$/, '').split(/\r?\n/);
 }
 
 function realpathSafe(dir) {
@@ -80,21 +150,24 @@ export const systemRepo = {
             localText(dir, ['rev-parse', '--is-shallow-repository']),
             localText(dir, ['config', '--get', 'remote.origin.url']),
         ]);
-        let upstream = null;
+        let parsedUpstream = { state: 'detached', remote: null, branch: null, target: null };
         if (branch) {
-            const merge = await localText(dir, ['config', '--get', `branch.${branch}.merge`]);
-            if (merge.startsWith('refs/heads/')) {
-                upstream = merge.slice('refs/heads/'.length);
-            } else if (merge.startsWith('refs/remotes/origin/')) {
-                upstream = merge.slice('refs/remotes/origin/'.length);
-            }
+            const [branchRemote, branchMerge] = await Promise.all([
+                localConfigAll(dir, `branch.${branch}.remote`),
+                localConfigAll(dir, `branch.${branch}.merge`),
+            ]);
+            parsedUpstream = parseBranchUpstreamConfig(branchRemote, branchMerge);
         }
+        const upstream = parsedUpstream.branch;
         const tracking = upstream ? await localText(dir, ['rev-parse', '--verify', '-q', `refs/remotes/origin/${upstream}^{commit}`]) : '';
         return {
             isRepo: true,
             head: head || null,
             branch: branch || null,
             upstream,
+            upstreamState: parsedUpstream.state,
+            upstreamRemote: parsedUpstream.remote,
+            upstreamTarget: parsedUpstream.target,
             shallow: shallow === 'true',
             remoteUrl,
             tracking: tracking || null,

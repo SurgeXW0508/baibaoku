@@ -185,15 +185,67 @@ function formatExtensionDisplayPath(target) {
 }
 
 export function resolveTrackedBranch(info) {
-    if (info?.upstream !== null && info?.upstream !== undefined) {
-        return info.branch && isSafeBranchName(info.upstream)
-            ? { branch: info.upstream, inferred: false }
-            : null;
+    const branch = info?.branch || null;
+    const state = info?.upstreamState ?? (
+        !branch
+            ? 'detached'
+            : (info.upstream !== null && info.upstream !== undefined ? 'origin' : 'none')
+    );
+    if (!branch || state === 'detached') {
+        return {
+            ok: false,
+            code: 'NO_UPSTREAM',
+            detached: true,
+            reason: '当前处于游离 HEAD 状态,缺少上游跟踪分支',
+        };
     }
-    if (info?.branch && isSafeBranchName(info.branch) && !isProtectedPersonalBranch(info.branch)) {
-        return { branch: info.branch, inferred: true };
+    if (state === 'non-origin') {
+        const targetLabel = info.upstreamTarget || info.upstreamRemote || '非 origin 远端';
+        return {
+            ok: false,
+            code: 'UNSUPPORTED_UPSTREAM',
+            detached: false,
+            reason: `分支「${branch}」跟踪的是「${targetLabel}」而非 origin`,
+        };
     }
-    return null;
+    if (state === 'incomplete') {
+        return {
+            ok: false,
+            code: 'NO_UPSTREAM',
+            detached: false,
+            incomplete: true,
+            reason: `分支「${branch}」的上游跟踪配置不完整`,
+        };
+    }
+    if (state === 'origin') {
+        if (!isSafeBranchName(info.upstream)) {
+            return {
+                ok: false,
+                code: 'NO_UPSTREAM',
+                detached: false,
+                incomplete: true,
+                reason: `分支「${branch}」的上游跟踪配置不合法`,
+            };
+        }
+        if (isProtectedPersonalBranch(branch) && info.upstream !== branch) {
+            return {
+                ok: false,
+                code: 'BRANCH_PROTECTED',
+                detached: false,
+                reason: `受保护分支「${branch}」跟踪了不一致的远端分支「${info.upstream}」`,
+            };
+        }
+        return { ok: true, branch: info.upstream, inferred: false };
+    }
+    if (!isSafeBranchName(branch) || isProtectedPersonalBranch(branch)) {
+        return {
+            ok: false,
+            code: 'NO_UPSTREAM',
+            detached: false,
+            reason: `分支「${branch}」缺少上游跟踪配置`,
+        };
+    }
+    return { ok: true, branch, inferred: true };
 }
 
 function downloadError(failures, action) {
@@ -612,26 +664,20 @@ async function performUpdate({ env, job, op, target, force }) {
     const displayPath = formatExtensionDisplayPath(target);
     const isPersonalBranch = isProtectedPersonalBranch(info.branch);
     const resolvedBranch = resolveTrackedBranch(info);
-    if (!resolvedBranch) {
-        const branchLabel = info.branch
-            ? `分支「${info.branch}」缺少上游跟踪配置`
-            : '当前处于游离 HEAD 状态,缺少上游跟踪分支';
-        throw new ExtensionOpError('NO_UPSTREAM', `「${folder}」${branchLabel},已阻止自动切换到远端默认分支。`, {
+    if (!resolvedBranch.ok) {
+        const suffix = resolvedBranch.code === 'NO_UPSTREAM'
+            ? ',已阻止自动切换到远端默认分支。'
+            : ',已阻止自动更新。';
+        const hint = info.branch
+            ? `请手动检查并将上游对齐到 origin(例如 git -C "${displayPath}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`
+            : '请先手动检出目标分支并配置 origin 上游跟踪后再更新。';
+        throw new ExtensionOpError(resolvedBranch.code, `「${folder}」${resolvedBranch.reason}${suffix}`, {
             status: 409,
             stage: 'inspect',
-            hint: info.branch
-                ? `请手动检查并绑定上游跟踪分支(例如 git -C "${displayPath}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`
-                : '请先手动检出目标分支并配置 origin 上游跟踪后再更新。',
+            hint,
         });
     }
     const trackedBranch = resolvedBranch.branch;
-    if (isPersonalBranch && trackedBranch !== info.branch) {
-        throw new ExtensionOpError('BRANCH_PROTECTED', `受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」,已阻止自动更新。`, {
-            status: 409,
-            stage: 'inspect',
-            hint: `请手动将上游对齐到同名分支(git -C "${displayPath}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`,
-        });
-    }
 
     stage(job, op, 'probe', '正在检查远端版本');
     const check = await checkRemote({
@@ -930,13 +976,13 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
 
     const isPersonalBranch = isProtectedPersonalBranch(info.branch);
     const resolvedBranch = resolveTrackedBranch(info);
-    if (!resolvedBranch) {
-        return failed(info.branch ? `分支「${info.branch}」缺少上游跟踪配置` : '当前处于游离 HEAD 状态,缺少上游跟踪分支', { code: 'NO_UPSTREAM', detached: !info.branch });
+    if (!resolvedBranch.ok) {
+        return failed(resolvedBranch.reason, {
+            code: resolvedBranch.code,
+            ...(resolvedBranch.code === 'NO_UPSTREAM' ? { detached: Boolean(resolvedBranch.detached) } : {}),
+        });
     }
     const trackedBranch = resolvedBranch.branch;
-    if (isPersonalBranch && trackedBranch !== info.branch) {
-        return failed(`受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」`, { code: 'BRANCH_PROTECTED' });
-    }
     const op = new OpRecorder({ kind: 'version', user: getUserHandle(req), extension: target.folder, global: target.global, backend: env.backend, gitVersion: env.gitVersion, source: remote.display });
     let check;
     try {

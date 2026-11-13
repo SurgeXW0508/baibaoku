@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createGitHttpClient } from './builtin-http.js';
 import { loadIsomorphicGit } from './git-module.js';
 import { clearInProgressState, getGitDir } from './repo-fs.js';
-import { tempRefName } from './repo-system.js';
+import { parseBranchUpstreamConfig, tempRefName } from './repo-system.js';
 import { classifyBuiltinError } from './sources.js';
 import { anySignal } from './util.js';
 
@@ -33,6 +33,15 @@ async function resolveOrNull(dir, ref) {
         return await git.resolveRef({ fs, dir, ref });
     } catch {
         return null;
+    }
+}
+
+async function readConfigAllSafe(dir, key) {
+    try {
+        const values = await git.getConfigAll({ fs, dir, path: key });
+        return Array.isArray(values) ? values : [];
+    } catch {
+        return [];
     }
 }
 
@@ -70,26 +79,29 @@ export const builtinRepo = {
             branch = null;
         }
         let remoteUrl = '';
-        let upstream = null;
         try {
-            remoteUrl = String((await git.getConfig({ fs, dir, path: 'remote.origin.url' })) ?? '');
-            if (branch) {
-                const merge = await git.getConfig({ fs, dir, path: `branch.${branch}.merge` });
-                if (typeof merge === 'string' && merge.startsWith('refs/heads/')) {
-                    upstream = merge.slice('refs/heads/'.length);
-                } else if (typeof merge === 'string' && merge.startsWith('refs/remotes/origin/')) {
-                    upstream = merge.slice('refs/remotes/origin/'.length);
-                }
-            }
+            remoteUrl = String((await git.getConfig({ fs, dir, path: 'remote.origin.url' })) ?? '').trim();
         } catch {
-            // 配置读不出来就当没有
+            remoteUrl = '';
         }
+        let parsedUpstream = { state: 'detached', remote: null, branch: null, target: null };
+        if (branch) {
+            const [branchRemote, branchMerge] = await Promise.all([
+                readConfigAllSafe(dir, `branch.${branch}.remote`),
+                readConfigAllSafe(dir, `branch.${branch}.merge`),
+            ]);
+            parsedUpstream = parseBranchUpstreamConfig(branchRemote, branchMerge);
+        }
+        const upstream = parsedUpstream.branch;
         const tracking = upstream ? await resolveOrNull(dir, `refs/remotes/origin/${upstream}`) : null;
         return {
             isRepo: true,
             head,
             branch,
             upstream,
+            upstreamState: parsedUpstream.state,
+            upstreamRemote: parsedUpstream.remote,
+            upstreamTarget: parsedUpstream.target,
             shallow: fs.existsSync(path.join(gitDir, 'shallow')),
             remoteUrl,
             tracking,
