@@ -3380,7 +3380,31 @@ function warmFastVersionCache() {
     });
 }
 
-function makeEarlyBridgeScript(options = {}) {
+const READONLY_WORLDINFO_PATHS = new Set([
+    '/api/worldinfo/get',
+    '/api/worldinfo/list',
+]);
+
+export function shouldInvalidateSettingsGetCachePath(pathname, method) {
+    if (method !== 'POST' || typeof pathname !== 'string') {
+        return false;
+    }
+    if (pathname === '/api/settings/save') {
+        return true;
+    }
+    if (READONLY_WORLDINFO_PATHS.has(pathname)) {
+        return false;
+    }
+    return [
+        '/api/worldinfo/',
+        '/api/presets/',
+        '/api/themes/',
+        '/api/quick-replies/',
+        '/api/moving-ui/',
+    ].some(prefix => pathname.startsWith(prefix));
+}
+
+export function makeEarlyBridgeScript(options = {}) {
     const apiPrefix = `/api/plugins/${PLUGIN_ID}`;
     const fastVersionPath = `${apiPrefix}/v1/fast-version`;
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
@@ -3909,6 +3933,7 @@ function makeEarlyBridgeScript(options = {}) {
   function shouldInvalidateSettingsGetCache(url, method) {
     if (!url || url.origin !== location.origin || method !== 'POST') return false;
     if (url.pathname === '/api/settings/save') return true;
+    if (url.pathname === '/api/worldinfo/get' || url.pathname === '/api/worldinfo/list') return false;
     return [
       '/api/worldinfo/',
       '/api/presets/',
