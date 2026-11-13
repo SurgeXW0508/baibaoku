@@ -120,7 +120,20 @@ enableServerPluginsAutoUpdate: false
 - 如果本次版本涉及数据库 schema 或数据迁移，必须先单独评估迁移是否可逆、旧代码能否读取新数据；不能仅凭 Git 回退认定数据可回滚。
 - 不得把容器重启成功或状态 API 返回成功，等同于完整业务验收。
 
-## 7. 代码任务结束时的部署交接
+## 7. 扩展管理接管安全默认值与主题懒加载说明
+
+跨仓库能力归属以 [SillyTavern Personal 维护规范](https://github.com/SurgeXW0508/SillyTavern/blob/release/docs/personal-fork/MAINTENANCE_COMPATIBILITY.md) 为准，柏宝库在个人分支上的运行期默认边界如下：
+
+- **扩展版本决定权与代理兼容**：
+  - `allowUnverifiedMirrorDecision` 默认 `false`：安装、更新扩展与启动自更新时，必须有**权威线路**（直连 GitHub 或经本地/配置代理访问 GitHub）确认目标提交 SHA；若仅有第三方镜像可达而直连与代理均不可达，默认拒绝更新并提示“仅镜像可达，无法确认版本”。权威线路确认目标 SHA 后，一致的镜像仍可作为下载通道加速拉取 Git 对象。确需在无代理纯镜像环境临时放开时，可显式配置 `allowUnverifiedMirrorDecision: true`。
+  - `cloudMirrorsEnabled` 默认 `false`：默认不拉取第三方云端镜像列表兜底。
+  - 代理自动探测保持开启（`autoDetectProxy: true`），继续识别环境变量、酒馆 `requestProxy`、Git `http.proxy` 以及本机常用端口 `7890 / 7897 / 10809 / 1080`（兼容 mihomo 等代理场景），且探测阶段保证快速响应的镜像不会提前中止尚未返回的权威代理探测。
+- **个人分支与上游跟踪保护**：
+  - 当扩展本地位于 `personal/*` 分支（如 `personal/stable`）且远端缺少同名分支，或本地分支缺少上游跟踪配置时，即使执行强制更新（`force: true`）也**不会**自动切回远端默认分支（如 `main`），避免误切回未裁剪的上游主线；需手动核对 `origin` 与上游跟踪关系后再更新。
+- **主题懒加载耦合与自动兜底**：
+  - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。当柏宝库检测到未安装/已禁用柏宝箱（`ST-BaiBai-Tools`）或 `public/scripts/power-user.js` 未安装主题桥时，会自动回退下发完整主题列表，避免单独禁用柏宝箱后无法切换主题。
+
+## 8. 代码任务结束时的部署交接
 
 凡任务修改了柏宝库 Runtime、依赖、数据库、API 或与 ST/柏宝箱的集成，完成实现、测试和独立审查后，必须在交接结尾明确：
 
