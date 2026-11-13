@@ -67,6 +67,8 @@ const { setCloudMirrorListUrl } = await import('../src/extension-manager/cloud-m
 const { ExtensionOpError } = await import('../src/extension-manager/errors.js');
 const { resetJobs } = await import('../src/extension-manager/jobs.js');
 const { flushOps } = await import('../src/extension-manager/oplog.js');
+const { builtinRepo } = await import('../src/extension-manager/repo-builtin.js');
+const { parseBranchUpstreamConfig, systemRepo } = await import('../src/extension-manager/repo-system.js');
 const { resetRouteStats, saveRouteStats } = await import('../src/extension-manager/sources.js');
 const service = await import('../src/extension-manager/service.js');
 
@@ -957,3 +959,239 @@ test('WP-K-4 & FX2-1: hasActiveLazyThemeHydrator validates scan cache by directo
         fs.readFileSync = origReadFileSync;
     }
 });
+
+test('FX3-2: system and builtin Git adapters verify complete (branch.<name>.remote, branch.<name>.merge) tracking tuple consistently', async () => {
+    // 1. Unit matrix for parseBranchUpstreamConfig + resolveTrackedBranch
+    const buildInfo = (branch, remoteValues, mergeValues) => {
+        if (!branch) {
+            return { branch: null, upstream: null, upstreamState: 'detached', upstreamRemote: null, upstreamTarget: null };
+        }
+        const parsed = parseBranchUpstreamConfig(remoteValues, mergeValues);
+        return {
+            branch,
+            upstream: parsed.branch,
+            upstreamState: parsed.state,
+            upstreamRemote: parsed.remote,
+            upstreamTarget: parsed.target,
+        };
+    };
+
+    assert.deepEqual(
+        service.resolveTrackedBranch(buildInfo('personal/stable', ['origin'], ['refs/heads/personal/stable'])),
+        { ok: true, branch: 'personal/stable', inferred: false },
+    );
+    assert.deepEqual(
+        service.resolveTrackedBranch(buildInfo('personal/stable', ['.'], ['refs/remotes/origin/personal/stable'])),
+        { ok: true, branch: 'personal/stable', inferred: false },
+    );
+
+    // Non-origin tracking (upstream, local tracking ref to upstream, or local branch) -> UNSUPPORTED_UPSTREAM on all branches
+    for (const [branch, remotes, merges] of [
+        ['personal/stable', ['upstream'], ['refs/heads/personal/stable']],
+        ['main', ['upstream'], ['refs/heads/main']],
+        ['personal/stable', ['.'], ['refs/remotes/upstream/personal/stable']],
+        ['main', ['.'], ['refs/heads/dev']],
+        ['personal/stable', ['upstream'], []],
+    ]) {
+        const res = service.resolveTrackedBranch(buildInfo(branch, remotes, merges));
+        assert.equal(res.ok, false, `expected rejection for ${branch} (${remotes} / ${merges})`);
+        assert.equal(res.code, 'UNSUPPORTED_UPSTREAM');
+    }
+
+    // Incomplete or malformed tracking (missing remote, missing merge, wrong ref prefix, multi-valued) -> NO_UPSTREAM (never infers!)
+    for (const [branch, remotes, merges] of [
+        ['personal/stable', [], ['refs/heads/personal/stable']],
+        ['main', [], ['refs/heads/main']],
+        ['personal/stable', ['origin'], []],
+        ['main', ['origin'], []],
+        ['main', ['origin'], ['refs/remotes/origin/main']],
+        ['main', ['origin'], ['refs/heads/main', 'refs/heads/dev']],
+        ['main', ['origin', 'upstream'], ['refs/heads/main']],
+    ]) {
+        const res = service.resolveTrackedBranch(buildInfo(branch, remotes, merges));
+        assert.equal(res.ok, false, `expected NO_UPSTREAM for ${branch} (${remotes} / ${merges})`);
+        assert.equal(res.code, 'NO_UPSTREAM');
+        assert.equal(res.incomplete, true);
+    }
+
+    // Complete absence -> Scheme A inference on normal branch only, NO_UPSTREAM on personal/*
+    assert.deepEqual(
+        service.resolveTrackedBranch(buildInfo('main', [], [])),
+        { ok: true, branch: 'main', inferred: true },
+    );
+    assert.equal(service.resolveTrackedBranch(buildInfo('personal/stable', [], [])).code, 'NO_UPSTREAM');
+    assert.equal(service.resolveTrackedBranch(buildInfo(null, [], [])).code, 'NO_UPSTREAM');
+
+    // 2. End-to-end Smart HTTP integration across both 'system' and 'builtin' Git backends
+    const adminReq = makeReq({ admin: true });
+    proxyState = { enabled: true, delayMs: 0 };
+    mirrorState = { enabled: false, delayMs: 0, root: authRemotesRoot };
+    resetRouteStats();
+    await service.updateManagerConfig(adminReq, {
+        autoDetectProxy: false,
+        proxy: proxyUrl,
+        prefixMirrors: [],
+        domainMirrors: [],
+        allowUnverifiedMirrorDecision: false,
+        cloudMirrorsEnabled: false,
+        probeTimeoutMs: 2500,
+    });
+
+    const repo = createGithubPairRepo('owner', 'fx3-tracking-parity', 'main');
+    const initialMainSha = repo.first;
+    const initialStableSha = repo.commit('personal v1.0.0', { 'manifest.json': manifest('1.0.0-personal') }, 'personal/stable');
+    const newerMainSha = repo.commit('main v1.1.0', { 'manifest.json': manifest('1.1.0') }, 'main');
+    const newerStableSha = repo.commit('personal v1.1.0', { 'manifest.json': manifest('1.1.0-personal') }, 'personal/stable');
+
+    for (const backend of ['system', 'builtin']) {
+        process.env.SILLYTAVERN_GIT_BACKEND = backend;
+        try {
+            const envCheck = await service.getEnvironment();
+            assert.equal(envCheck.backend, backend, `must exercise ${backend} Git adapter`);
+
+            // Case A: personal/stable explicitly tracking upstream/personal/stable must NOT update from origin/personal/stable
+            const extUpstreamPersonalName = `fx3-upstream-personal-${backend}`;
+            const extUpstreamPersonalDir = path.join(userExtensions, extUpstreamPersonalName);
+            git(tmpRoot, 'clone', '-q', '-b', 'personal/stable', repo.authBare, extUpstreamPersonalDir);
+            git(extUpstreamPersonalDir, 'reset', '-q', '--hard', initialStableSha);
+            git(extUpstreamPersonalDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            git(extUpstreamPersonalDir, 'remote', 'add', 'upstream', 'http://github.com/other/upstream-fork.git');
+            git(extUpstreamPersonalDir, 'config', 'branch.personal/stable.remote', 'upstream');
+            git(extUpstreamPersonalDir, 'config', 'branch.personal/stable.merge', 'refs/heads/personal/stable');
+
+            const [sysInspectA, builtinInspectA] = await Promise.all([
+                systemRepo.inspect(extUpstreamPersonalDir),
+                builtinRepo.inspect(extUpstreamPersonalDir),
+            ]);
+            for (const inspected of [sysInspectA, builtinInspectA]) {
+                assert.equal(inspected.upstream, null);
+                assert.equal(inspected.upstreamState, 'non-origin');
+                assert.equal(inspected.upstreamRemote, 'upstream');
+                assert.equal(inspected.upstreamTarget, 'upstream/personal/stable');
+            }
+
+            const verA = await service.checkExtensionVersion(adminReq, { extensionName: extUpstreamPersonalName, global: false });
+            assert.equal(verA.isUpToDate, true);
+            assert.equal(verA.baibaoku?.remoteCheckFailed, true);
+            assert.equal(verA.baibaoku?.code, 'UNSUPPORTED_UPSTREAM');
+
+            for (const force of [false, true]) {
+                await rejectsWith(
+                    service.updateExtension(adminReq, { extensionName: extUpstreamPersonalName, global: false, force }),
+                    'UNSUPPORTED_UPSTREAM',
+                    err => err.message.includes('upstream/personal/stable'),
+                );
+            }
+            assert.equal(git(extUpstreamPersonalDir, 'rev-parse', 'HEAD'), initialStableSha);
+            assert.equal(git(extUpstreamPersonalDir, 'config', '--get', 'branch.personal/stable.remote'), 'upstream');
+
+            // Case B: normal branch `main` tracking `upstream/main` must also reject (no silent origin/main inference or config overwrite)
+            const extUpstreamMainName = `fx3-upstream-main-${backend}`;
+            const extUpstreamMainDir = path.join(userExtensions, extUpstreamMainName);
+            git(tmpRoot, 'clone', '-q', '-b', 'main', repo.authBare, extUpstreamMainDir);
+            git(extUpstreamMainDir, 'reset', '-q', '--hard', initialMainSha);
+            git(extUpstreamMainDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            git(extUpstreamMainDir, 'remote', 'add', 'upstream', 'http://github.com/other/upstream-main.git');
+            git(extUpstreamMainDir, 'config', 'branch.main.remote', 'upstream');
+            git(extUpstreamMainDir, 'config', 'branch.main.merge', 'refs/heads/main');
+
+            const verB = await service.checkExtensionVersion(adminReq, { extensionName: extUpstreamMainName, global: false });
+            assert.equal(verB.baibaoku?.remoteCheckFailed, true);
+            assert.equal(verB.baibaoku?.code, 'UNSUPPORTED_UPSTREAM');
+
+            for (const force of [false, true]) {
+                await rejectsWith(
+                    service.updateExtension(adminReq, { extensionName: extUpstreamMainName, global: false, force }),
+                    'UNSUPPORTED_UPSTREAM',
+                );
+            }
+            assert.equal(git(extUpstreamMainDir, 'rev-parse', 'HEAD'), initialMainSha);
+            assert.equal(git(extUpstreamMainDir, 'config', '--get', 'branch.main.remote'), 'upstream');
+
+            // Case C: deleting branch.personal/stable.remote while leaving merge (or vice versa) must trigger NO_UPSTREAM
+            const extHalfConfigName = `fx3-half-config-${backend}`;
+            const extHalfConfigDir = path.join(userExtensions, extHalfConfigName);
+            git(tmpRoot, 'clone', '-q', '-b', 'personal/stable', repo.authBare, extHalfConfigDir);
+            git(extHalfConfigDir, 'reset', '-q', '--hard', initialStableSha);
+            git(extHalfConfigDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            git(extHalfConfigDir, 'config', '--unset', 'branch.personal/stable.remote');
+            assert.equal(git(extHalfConfigDir, 'config', '--get', 'branch.personal/stable.merge'), 'refs/heads/personal/stable');
+
+            const [sysInspectC, builtinInspectC] = await Promise.all([
+                systemRepo.inspect(extHalfConfigDir),
+                builtinRepo.inspect(extHalfConfigDir),
+            ]);
+            for (const inspected of [sysInspectC, builtinInspectC]) {
+                assert.equal(inspected.upstream, null);
+                assert.equal(inspected.upstreamState, 'incomplete');
+            }
+
+            const verC1 = await service.checkExtensionVersion(adminReq, { extensionName: extHalfConfigName, global: false });
+            assert.equal(verC1.baibaoku?.remoteCheckFailed, true);
+            assert.equal(verC1.baibaoku?.code, 'NO_UPSTREAM');
+            for (const force of [false, true]) {
+                await rejectsWith(
+                    service.updateExtension(adminReq, { extensionName: extHalfConfigName, global: false, force }),
+                    'NO_UPSTREAM',
+                );
+            }
+            assert.equal(git(extHalfConfigDir, 'rev-parse', 'HEAD'), initialStableSha);
+
+            // Flip half-config: remote=origin present, merge deleted -> also NO_UPSTREAM
+            git(extHalfConfigDir, 'config', 'branch.personal/stable.remote', 'origin');
+            git(extHalfConfigDir, 'config', '--unset', 'branch.personal/stable.merge');
+            const verC2 = await service.checkExtensionVersion(adminReq, { extensionName: extHalfConfigName, global: false });
+            assert.equal(verC2.baibaoku?.remoteCheckFailed, true);
+            assert.equal(verC2.baibaoku?.code, 'NO_UPSTREAM');
+            await rejectsWith(
+                service.updateExtension(adminReq, { extensionName: extHalfConfigName, global: false, force: true }),
+                'NO_UPSTREAM',
+            );
+            assert.equal(git(extHalfConfigDir, 'rev-parse', 'HEAD'), initialStableSha);
+
+            // Normal branch `main` with deleted remote + leftover merge -> also NO_UPSTREAM (must not infer!)
+            const extHalfMainName = `fx3-half-main-${backend}`;
+            const extHalfMainDir = path.join(userExtensions, extHalfMainName);
+            git(tmpRoot, 'clone', '-q', '-b', 'main', repo.authBare, extHalfMainDir);
+            git(extHalfMainDir, 'reset', '-q', '--hard', initialMainSha);
+            git(extHalfMainDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            git(extHalfMainDir, 'config', '--unset', 'branch.main.remote');
+            await rejectsWith(
+                service.updateExtension(adminReq, { extensionName: extHalfMainName, global: false, force: true }),
+                'NO_UPSTREAM',
+            );
+            assert.equal(git(extHalfMainDir, 'rev-parse', 'HEAD'), initialMainSha);
+
+            // Case D: valid local tracking ref (remote='.' + merge='refs/remotes/origin/personal/stable') updates cleanly
+            const extDotOriginName = `fx3-dot-origin-${backend}`;
+            const extDotOriginDir = path.join(userExtensions, extDotOriginName);
+            git(tmpRoot, 'clone', '-q', '-b', 'personal/stable', repo.authBare, extDotOriginDir);
+            git(extDotOriginDir, 'reset', '-q', '--hard', initialStableSha);
+            git(extDotOriginDir, 'update-ref', 'refs/remotes/origin/personal/stable', initialStableSha);
+            git(extDotOriginDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            git(extDotOriginDir, 'config', 'branch.personal/stable.remote', '.');
+            git(extDotOriginDir, 'config', 'branch.personal/stable.merge', 'refs/remotes/origin/personal/stable');
+
+            const verD = await service.checkExtensionVersion(adminReq, { extensionName: extDotOriginName, global: false });
+            assert.equal(verD.isUpToDate, false);
+            const updatedD = await service.updateExtension(adminReq, { extensionName: extDotOriginName, global: false });
+            assert.equal(updatedD.response.shortCommitHash, newerStableSha.slice(0, 7));
+            assert.equal(git(extDotOriginDir, 'rev-parse', 'HEAD'), newerStableSha);
+            assert.equal(git(extDotOriginDir, 'rev-parse', 'refs/remotes/origin/personal/stable'), newerStableSha);
+
+            // Also verify standard origin/main still updates normally to newerMainSha
+            const extStdMainName = `fx3-std-main-${backend}`;
+            const extStdMainDir = path.join(userExtensions, extStdMainName);
+            git(tmpRoot, 'clone', '-q', '-b', 'main', repo.authBare, extStdMainDir);
+            git(extStdMainDir, 'reset', '-q', '--hard', initialMainSha);
+            git(extStdMainDir, 'update-ref', 'refs/remotes/origin/main', initialMainSha);
+            git(extStdMainDir, 'remote', 'set-url', 'origin', repo.canonicalHttpUrl);
+            const updatedStd = await service.updateExtension(adminReq, { extensionName: extStdMainName, global: false });
+            assert.equal(updatedStd.response.shortCommitHash, newerMainSha.slice(0, 7));
+            assert.equal(git(extStdMainDir, 'rev-parse', 'HEAD'), newerMainSha);
+        } finally {
+            process.env.SILLYTAVERN_GIT_BACKEND = 'system';
+        }
+    }
+});
+
