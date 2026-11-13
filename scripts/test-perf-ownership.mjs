@@ -46,11 +46,13 @@ const { setConfigFilePath } = await import('../../../src/util.js');
 setConfigFilePath(configYamlFile);
 
 const { patchIndexHtml } = await import('../src/early-bridge-installer.js');
-const { patchPowerUserJs } = await import('../src/theme-bridge-installer.js');
+const { getThemeBridgeStatus, installThemeBridge, patchPowerUserJs } = await import('../src/theme-bridge-installer.js');
 const { patchRegexEngineJs } = await import('../src/regex-bridge-installer.js');
 const { patchOpenAIJs, unpatchOpenAIJs } = await import('../src/openai-tokenizer-bridge-installer.js');
 const { patchWorldInfoJs, unpatchWorldInfoJs } = await import('../src/world-info-tokenizer-bridge-installer.js');
 const {
+    SETTINGS_CACHE_INVALIDATE_PREFIXES,
+    SETTINGS_CACHE_READONLY_PATHS,
     closeStEndpointCaches,
     countSingleMessageBulk,
     hasActiveLazyThemeHydrator,
@@ -453,6 +455,31 @@ test('WP-K-2: read-only World Info routes do not invalidate settingsGetCache whi
     });
     vm.runInNewContext(script, windowObj);
     assert.equal(windowObj.__baibaokuEarlyBridge?.installed, true);
+    assert.equal(script.includes(JSON.stringify(SETTINGS_CACHE_READONLY_PATHS)), true, 'script must inject SETTINGS_CACHE_READONLY_PATHS JSON');
+    assert.equal(script.includes(JSON.stringify(SETTINGS_CACHE_INVALIDATE_PREFIXES)), true, 'script must inject SETTINGS_CACHE_INVALIDATE_PREFIXES JSON');
+
+    const checkPaths = [
+        '/api/settings/save',
+        '/api/worldinfo/get',
+        '/api/worldinfo/list',
+        '/api/worldinfo/edit',
+        '/api/worldinfo/delete',
+        '/api/presets/save',
+        '/api/themes/save',
+        '/api/quick-replies/save',
+        '/api/moving-ui/save',
+        '/api/chats/get',
+    ];
+    for (const checkPath of checkPaths) {
+        for (const method of ['POST', 'GET']) {
+            const clientResult = windowObj.__baibaokuEarlyBridge.shouldInvalidateSettingsGetCache(
+                new windowObj.URL(checkPath, 'http://127.0.0.1:8000'),
+                method,
+            );
+            const serverResult = shouldInvalidateSettingsGetCachePath(checkPath, method);
+            assert.equal(clientResult, serverResult, `mismatch for ${method} ${checkPath}`);
+        }
+    }
 
     await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' });
     assert.equal(fastSettingsHits, 1);
@@ -473,7 +500,7 @@ test('WP-K-2: read-only World Info routes do not invalidate settingsGetCache whi
     assert.equal(fastSettingsHits, 2, 'worldinfo/edit must invalidate settingsGetCache');
 });
 
-test('WP-K-3: security defaults, mirror-only rejection, personal/* & missing-upstream protection, and mihomo proxy + mirror behavior', async () => {
+test('WP-K-3: security defaults, mirror-only rejection, Option A same-name branch inference, personal/* protection, and mihomo proxy + mirror behavior', async () => {
     // 0. Verify default config values
     const defaults = getDefaultConfig();
     assert.equal(defaults.allowUnverifiedMirrorDecision, false);
@@ -536,6 +563,17 @@ test('WP-K-3: security defaults, mirror-only rejection, personal/* & missing-ups
     git(tmpRoot, 'clone', '-q', '-b', 'personal/stable', repoB.authBare, extBDir);
     git(extBDir, 'remote', 'set-url', 'origin', repoB.canonicalHttpUrl);
 
+    // Mismatched upstream on `personal/stable` -> BRANCH_PROTECTED with relative path in hint (K4)
+    git(extBDir, 'config', 'branch.personal/stable.merge', 'refs/heads/main');
+    const verBMismatched = await service.checkExtensionVersion(adminReq, { extensionName: 'personal-ext', global: false });
+    assert.equal(verBMismatched.baibaoku?.code, 'BRANCH_PROTECTED');
+    await rejectsWith(
+        service.updateExtension(adminReq, { extensionName: 'personal-ext', global: false }),
+        'BRANCH_PROTECTED',
+        err => err.hint.includes('extensions/personal-ext') && !err.hint.includes(tmpRoot),
+    );
+    git(extBDir, 'config', 'branch.personal/stable.merge', 'refs/heads/personal/stable');
+
     // Delete `personal/stable` on authoritative remote, leaving `main` intact
     git(repoB.authBare, 'branch', '-D', 'personal/stable');
 
@@ -550,20 +588,105 @@ test('WP-K-3: security defaults, mirror-only rejection, personal/* & missing-ups
     assert.equal(git(extBDir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'personal/stable');
     assert.equal(git(extBDir, 'rev-parse', 'HEAD'), stableShaB);
 
-    // 3. Scenario C: Missing upstream tracking (`git branch --unset-upstream`) refuses auto-switch even with force=true
-    const repoC = createGithubPairRepo('owner', 'untracked-ext', 'main');
-    const extCDir = path.join(userExtensions, 'untracked-ext');
-    git(tmpRoot, 'clone', '-q', repoC.authBare, extCDir);
-    git(extCDir, 'remote', 'set-url', 'origin', repoC.canonicalHttpUrl);
-    git(extCDir, 'branch', '--unset-upstream');
-    repoC.commit('v1.2.0', { 'manifest.json': manifest('1.2.0') }, 'main');
+    // 3. Scenario C (K2 Option A + K4 relative hints):
+    // C1: Non-personal branch missing `branch.<b>.merge` + authoritative remote HAS same-name branch -> updates & writes upstream config (both system & builtin)
+    const repoC1 = createGithubPairRepo('owner', 'inferred-same-branch-ext', 'main');
+    const extC1SysDir = path.join(userExtensions, 'inferred-same-branch-sys');
+    git(tmpRoot, 'clone', '-q', repoC1.authBare, extC1SysDir);
+    git(extC1SysDir, 'remote', 'set-url', 'origin', repoC1.canonicalHttpUrl);
+    git(extC1SysDir, 'branch', '--unset-upstream');
+    const c1SecondSha = repoC1.commit('v1.2.0', { 'manifest.json': manifest('1.2.0') }, 'main');
+
+    const verC1Before = await service.checkExtensionVersion(adminReq, { extensionName: 'inferred-same-branch-sys', global: false });
+    assert.equal(verC1Before.isUpToDate, false);
+    assert.equal(Boolean(verC1Before.baibaoku?.remoteCheckFailed), false);
+
+    const updatedC1Sys = await service.updateExtension(adminReq, { extensionName: 'inferred-same-branch-sys', global: false });
+    assert.equal(updatedC1Sys.response.shortCommitHash, c1SecondSha.slice(0, 7));
+    assert.equal(git(extC1SysDir, 'rev-parse', 'HEAD'), c1SecondSha);
+    assert.equal(git(extC1SysDir, 'config', '--get', 'branch.main.remote'), 'origin');
+    assert.equal(git(extC1SysDir, 'config', '--get', 'branch.main.merge'), 'refs/heads/main');
+
+    // Builtin backend parity for C1
+    const extC1BuiltinDir = path.join(userExtensions, 'inferred-same-branch-builtin');
+    git(tmpRoot, 'clone', '-q', repoC1.authBare, extC1BuiltinDir);
+    git(extC1BuiltinDir, 'reset', '-q', '--hard', repoC1.first);
+    git(extC1BuiltinDir, 'remote', 'set-url', 'origin', repoC1.canonicalHttpUrl);
+    git(extC1BuiltinDir, 'branch', '--unset-upstream');
+    process.env.SILLYTAVERN_GIT_BACKEND = 'builtin';
+    try {
+        const verC1Builtin = await service.checkExtensionVersion(adminReq, { extensionName: 'inferred-same-branch-builtin', global: false });
+        assert.equal(verC1Builtin.isUpToDate, false);
+        const updatedC1Builtin = await service.updateExtension(adminReq, { extensionName: 'inferred-same-branch-builtin', global: false });
+        assert.equal(updatedC1Builtin.response.shortCommitHash, c1SecondSha.slice(0, 7));
+        assert.equal(git(extC1BuiltinDir, 'rev-parse', 'HEAD'), c1SecondSha);
+        assert.equal(git(extC1BuiltinDir, 'config', '--get', 'branch.main.remote'), 'origin');
+        assert.equal(git(extC1BuiltinDir, 'config', '--get', 'branch.main.merge'), 'refs/heads/main');
+    } finally {
+        process.env.SILLYTAVERN_GIT_BACKEND = 'system';
+    }
+
+    // C2: Non-personal branch missing `branch.<b>.merge` + remote does NOT have same-name branch -> NO_UPSTREAM (never switches to default branch, even with force=true)
+    const repoC2 = createGithubPairRepo('owner', 'inferred-missing-remote-ext', 'main');
+    const legacyShaC2 = repoC2.commit('legacy v1.0.1', { 'manifest.json': manifest('1.0.1') }, 'legacy-branch');
+    const extC2Dir = path.join(userExtensions, 'inferred-missing-remote-ext');
+    git(tmpRoot, 'clone', '-q', '-b', 'legacy-branch', repoC2.authBare, extC2Dir);
+    git(extC2Dir, 'remote', 'set-url', 'origin', repoC2.canonicalHttpUrl);
+    git(extC2Dir, 'branch', '--unset-upstream');
+    git(repoC2.authBare, 'branch', '-D', 'legacy-branch');
+    repoC2.commit('main v2.0.0', { 'manifest.json': manifest('2.0.0') }, 'main');
+
+    const verC2 = await service.checkExtensionVersion(adminReq, { extensionName: 'inferred-missing-remote-ext', global: false });
+    assert.equal(verC2.isUpToDate, true);
+    assert.equal(verC2.baibaoku?.remoteCheckFailed, true);
+    assert.equal(verC2.baibaoku?.code, 'NO_UPSTREAM');
 
     await rejectsWith(
-        service.updateExtension(adminReq, { extensionName: 'untracked-ext', global: false, force: false }),
+        service.updateExtension(adminReq, { extensionName: 'inferred-missing-remote-ext', global: false, force: false }),
         'NO_UPSTREAM',
+        err => err.hint.includes('extensions/inferred-missing-remote-ext') && !err.hint.includes(tmpRoot),
     );
     await rejectsWith(
-        service.updateExtension(adminReq, { extensionName: 'untracked-ext', global: false, force: true }),
+        service.updateExtension(adminReq, { extensionName: 'inferred-missing-remote-ext', global: false, force: true }),
+        'NO_UPSTREAM',
+        err => err.hint.includes('extensions/inferred-missing-remote-ext') && !err.hint.includes(tmpRoot),
+    );
+    assert.equal(git(extC2Dir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'legacy-branch');
+    assert.equal(git(extC2Dir, 'rev-parse', 'HEAD'), legacyShaC2);
+
+    // C3: `personal/*` missing upstream -> NO_UPSTREAM (even when remote `personal/stable` exists), global hint uses relative third-party path
+    const repoC3 = createGithubPairRepo('owner', 'personal-no-upstream-ext', 'main');
+    repoC3.commit('personal v1.1.0', { 'manifest.json': manifest('1.1.0') }, 'personal/stable');
+    const globalExtensionsDir = path.join(tmpRoot, 'public', 'scripts', 'extensions', 'third-party');
+    fs.mkdirSync(globalExtensionsDir, { recursive: true });
+    const extC3GlobalDir = path.join(globalExtensionsDir, 'personal-no-upstream-ext');
+    git(tmpRoot, 'clone', '-q', '-b', 'personal/stable', repoC3.authBare, extC3GlobalDir);
+    git(extC3GlobalDir, 'remote', 'set-url', 'origin', repoC3.canonicalHttpUrl);
+    git(extC3GlobalDir, 'branch', '--unset-upstream');
+
+    const verC3 = await service.checkExtensionVersion(adminReq, { extensionName: 'personal-no-upstream-ext', global: true });
+    assert.equal(verC3.baibaoku?.remoteCheckFailed, true);
+    assert.equal(verC3.baibaoku?.code, 'NO_UPSTREAM');
+
+    await rejectsWith(
+        service.updateExtension(adminReq, { extensionName: 'personal-no-upstream-ext', global: true, force: true }),
+        'NO_UPSTREAM',
+        err => err.hint.includes('public/scripts/extensions/third-party/personal-no-upstream-ext') && !err.hint.includes(tmpRoot),
+    );
+
+    // C4: Detached HEAD -> NO_UPSTREAM across checkExtensionVersion and updateExtension
+    const extC4Dir = path.join(userExtensions, 'detached-head-ext');
+    git(tmpRoot, 'clone', '-q', repoC1.authBare, extC4Dir);
+    git(extC4Dir, 'remote', 'set-url', 'origin', repoC1.canonicalHttpUrl);
+    git(extC4Dir, 'checkout', '-q', '--detach', 'HEAD');
+
+    const verC4 = await service.checkExtensionVersion(adminReq, { extensionName: 'detached-head-ext', global: false });
+    assert.equal(verC4.baibaoku?.remoteCheckFailed, true);
+    assert.equal(verC4.baibaoku?.code, 'NO_UPSTREAM');
+    assert.equal(verC4.baibaoku?.detached, true);
+
+    await rejectsWith(
+        service.updateExtension(adminReq, { extensionName: 'detached-head-ext', global: false, force: true }),
         'NO_UPSTREAM',
     );
 
@@ -604,74 +727,158 @@ test('WP-K-3: security defaults, mirror-only rejection, personal/* & missing-ups
     assert.equal(fs.readFileSync(path.join(extDDir, 'index.js'), 'utf8'), 'export default "legit";\n');
 });
 
-test('WP-K-4: hasActiveLazyThemeHydrator falls back to full themes when ST-BaiBai-Tools or theme bridge is absent/disabled', () => {
+test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids sync power-user reads, and respects live disabledExtensions', () => {
     const extRoot = path.join(tmpRoot, 'theme-hydrator-exts');
     const globalRoot = path.join(tmpRoot, 'theme-hydrator-global');
     fs.mkdirSync(extRoot, { recursive: true });
     fs.mkdirSync(globalRoot, { recursive: true });
 
     const powerUserWithBridge = path.join(tmpRoot, 'power-user-patched.js');
-    const powerUserWithoutBridge = path.join(tmpRoot, 'power-user-unpatched.js');
-    fs.writeFileSync(powerUserWithBridge, 'function applyTheme() {}\n// baibaoku theme bridge:start\n// baibaoku theme bridge:end\n');
-    fs.writeFileSync(powerUserWithoutBridge, 'function applyTheme() {}\n');
+    const powerUserAnchorMismatch = path.join(tmpRoot, 'power-user-anchor-mismatch.js');
+    fs.writeFileSync(powerUserWithBridge, 'function applyTheme(name) {\n    console.log(\'theme applied: \' + name);\n}\n');
+    fs.writeFileSync(powerUserAnchorMismatch, 'function applyThemeCustom() {}\n');
+
+    // Install theme bridge once at startup: records status in memory (true for matched anchor, false for anchor mismatch)
+    const installedOk = installThemeBridge({ powerUserPath: powerUserWithBridge });
+    assert.equal(installedOk.installed, true);
+    assert.equal(getThemeBridgeStatus({ powerUserPath: powerUserWithBridge }), true);
+
+    const mismatchResult = installThemeBridge({ powerUserPath: powerUserAnchorMismatch });
+    assert.equal(mismatchResult.installed, false);
+    assert.equal(getThemeBridgeStatus({ powerUserPath: powerUserAnchorMismatch }), false);
 
     const req = makeReq({ extensionsDir: extRoot });
+    const t0 = 1_700_000_000_000;
 
-    // 1. Missing ST-BaiBai-Tools -> false
+    // 1. Missing ST-BaiBai-Tools at t0 -> false
     assert.equal(
         hasActiveLazyThemeHydrator(req, '{}', {
             globalExtensionsDir: globalRoot,
             powerUserPath: powerUserWithBridge,
             extensionsEnabled: true,
+            now: t0,
         }),
         false,
     );
 
-    // 2. Installed & enabled ST-BaiBai-Tools + patched power-user.js -> true
+    // Add ST-BaiBai-Tools and another extension on disk
     const toolsDir = path.join(extRoot, 'ST-BaiBai-Tools');
+    const otherExtDir = path.join(extRoot, 'other-ext');
     fs.mkdirSync(toolsDir, { recursive: true });
+    fs.mkdirSync(otherExtDir, { recursive: true });
     fs.writeFileSync(path.join(toolsDir, 'manifest.json'), JSON.stringify({ display_name: '柏宝箱', js: 'dist/index.js' }));
+    fs.writeFileSync(path.join(otherExtDir, 'manifest.json'), JSON.stringify({ display_name: 'Other', js: 'index.js' }));
+
+    // Within 30s TTL (t0 + 10s), cached empty scan still holds; after TTL expires (t0 + 31s), rescans and returns true
     assert.equal(
         hasActiveLazyThemeHydrator(req, '{}', {
             globalExtensionsDir: globalRoot,
             powerUserPath: powerUserWithBridge,
             extensionsEnabled: true,
-        }),
-        true,
-    );
-
-    // 3. Disabled in extension_settings.disabledExtensions -> false
-    const disabledSettings = JSON.stringify({
-        extension_settings: {
-            disabledExtensions: ['third-party/ST-BaiBai-Tools'],
-        },
-    });
-    assert.equal(
-        hasActiveLazyThemeHydrator(req, disabledSettings, {
-            globalExtensionsDir: globalRoot,
-            powerUserPath: powerUserWithBridge,
-            extensionsEnabled: true,
+            now: t0 + 10_000,
         }),
         false,
     );
 
-    // 4. Global extensionsEnabled === false -> false
-    assert.equal(
-        hasActiveLazyThemeHydrator(req, '{}', {
-            globalExtensionsDir: globalRoot,
-            powerUserPath: powerUserWithBridge,
-            extensionsEnabled: false,
-        }),
-        false,
-    );
+    let readdirCalls = 0;
+    let readFileCalls = 0;
+    const origReaddirSync = fs.readdirSync;
+    const origReadFileSync = fs.readFileSync;
+    fs.readdirSync = (...args) => {
+        readdirCalls += 1;
+        return origReaddirSync.apply(fs, args);
+    };
+    fs.readFileSync = (...args) => {
+        readFileCalls += 1;
+        return origReadFileSync.apply(fs, args);
+    };
 
-    // 5. Unpatched power-user.js (missing theme bridge marker) -> false
-    assert.equal(
-        hasActiveLazyThemeHydrator(req, '{}', {
-            globalExtensionsDir: globalRoot,
-            powerUserPath: powerUserWithoutBridge,
-            extensionsEnabled: true,
-        }),
-        false,
-    );
+    try {
+        // 2. TTL expired at t0 + 31s -> rescans directories once, returns true
+        const t1 = t0 + 31_000;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t1,
+            }),
+            true,
+        );
+        assert.ok(readdirCalls > 0, 'expired TTL should trigger directory rescan');
+
+        // 3. Repeated calls within 30s (t1 + 5s) trigger ZERO readdirSync and ZERO readFileSync
+        readdirCalls = 0;
+        readFileCalls = 0;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t1 + 5_000,
+            }),
+            true,
+        );
+        assert.equal(readdirCalls, 0, 'repeated call within 30s must not call readdirSync');
+        assert.equal(readFileCalls, 0, 'repeated call within 30s must not call readFileSync');
+
+        // 4. Disabling Tools in settingsText immediately returns false (disabledExtensions is never cached):
+        //    extRoot hits cache (0 IO), globalRoot's t0 cache expired so it rescans once, then subsequent calls do 0 IO.
+        const disabledSettings = JSON.stringify({
+            extension_settings: {
+                disabledExtensions: ['third-party/ST-BaiBai-Tools'],
+            },
+        });
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, disabledSettings, {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t1 + 6_000,
+            }),
+            false,
+        );
+        assert.equal(readdirCalls, 1, 'only expired globalRoot should rescan once when extRoot toolkit is disabled');
+        assert.equal(readFileCalls, 0);
+
+        readdirCalls = 0;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, disabledSettings, {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t1 + 6_500,
+            }),
+            false,
+        );
+        assert.equal(readdirCalls, 0);
+        assert.equal(readFileCalls, 0);
+
+        // 5. Global extensionsEnabled === false -> false
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: false,
+                now: t1 + 7_000,
+            }),
+            false,
+        );
+
+        // 6. Anchor mismatch recorded by installThemeBridge -> returns false with zero sync IO
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserAnchorMismatch,
+                extensionsEnabled: true,
+                now: t1 + 8_000,
+            }),
+            false,
+        );
+        assert.equal(readdirCalls, 0);
+        assert.equal(readFileCalls, 0);
+    } finally {
+        fs.readdirSync = origReaddirSync;
+        fs.readFileSync = origReadFileSync;
+    }
 });
