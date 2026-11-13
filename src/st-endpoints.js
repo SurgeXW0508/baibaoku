@@ -1697,14 +1697,30 @@ const LAZY_THEME_TOOLKIT_SCAN_TTL_MS = 30_000;
 const lazyThemeToolkitDirCache = new Map();
 
 function scanExtensionBaseForToolkitFolders(baseDir, now) {
+    let dirExists = false;
+    let mtimeMs = 0;
+    try {
+        const stat = fs.statSync(baseDir);
+        if (stat.isDirectory()) {
+            dirExists = true;
+            mtimeMs = stat.mtimeMs;
+        }
+    } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') {
+            throw error;
+        }
+    }
+
     const cached = lazyThemeToolkitDirCache.get(baseDir);
-    if (cached && now < cached.expiresAt) {
+    if (cached && cached.exists === dirExists && cached.mtimeMs === mtimeMs && now < cached.expiresAt) {
         return cached.entries;
     }
 
-    if (!fs.existsSync(baseDir)) {
+    if (!dirExists) {
         const emptyEntries = [];
         lazyThemeToolkitDirCache.set(baseDir, {
+            exists: false,
+            mtimeMs: 0,
             entries: emptyEntries,
             expiresAt: now + LAZY_THEME_TOOLKIT_SCAN_TTL_MS,
         });
@@ -1748,6 +1764,8 @@ function scanExtensionBaseForToolkitFolders(baseDir, now) {
     }
 
     lazyThemeToolkitDirCache.set(baseDir, {
+        exists: true,
+        mtimeMs,
         entries,
         expiresAt: now + LAZY_THEME_TOOLKIT_SCAN_TTL_MS,
     });
