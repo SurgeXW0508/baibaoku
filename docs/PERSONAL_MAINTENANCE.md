@@ -135,8 +135,10 @@ enableServerPluginsAutoUpdate: false
   - `personal/*` 分支（如 `personal/stable`）**必须**具备完整的 `origin` 上游跟踪关系（`remote=origin` + `refs/heads/<branch>`，或 `remote=.` + `refs/remotes/origin/<branch>`），且跟踪分支名必须与当前 `personal/*` 分支一致；完全缺失上游或远端不存在该受保护分支时一律报 `NO_UPSTREAM` / `BRANCH_PROTECTED` 拦截，游离 `HEAD` 同样报 `NO_UPSTREAM`。
   - 仅在 `branch.<name>.remote` 与 `branch.<name>.merge` **同时未配置**的非 `personal/*` 合法分支上，当**权威线路**确认远端存在 `origin/<同名分支>` 时才允许按同名分支检查或更新，并在更新成功后自动补写 `branch.<name>.remote`、`branch.<name>.merge` 与 `remote.origin.fetch`（`system` 与 `builtin` 双后端一致）；若远端不存在同名分支，仍报 `NO_UPSTREAM` 拦截。
   - 任何情况下（包括 `force: true` 强制更新）都**不会**自动切回远端默认分支（如 `main`），避免误切回未裁剪的上游主线；提示信息仅展示相对扩展路径（`extensions/<folder>` 或 `public/scripts/extensions/third-party/<folder>`）。
-- **主题懒加载耦合与自动兜底**：
+- **主题懒加载耦合、扩展 Manifest 缓存与设置缓存凭据边界**：
   - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果以目录 `mtimeMs` 校验配合 30 秒 TTL 兜底缓存（`FX2-1`，禁用列表每次实时从设置解析；世界书 Tokenizer 桥接宏门控同步覆盖旧式 `<CHARIFNOTGROUP>/<GROUP>`，`FX2-2`，详以 ST canonical 规范为准）；检测到未安装/刚卸载/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动立即回退下发完整主题列表，避免单独禁用或卸载柏宝箱后无法切换主题。
+  - `early-bridge` 仅拦截扩展根目录 `/scripts/extensions/third-party/<扩展>/manifest.json`；缓存未命中或扩展子目录内的 `manifest.json` 一律交还酒馆原生静态路由，不伪造 404（`0.7.4`）。
+  - `data/<user>/baibaoku/cache/` 中的设置快速载荷缓存会镜像 `extension_settings`（包括柏宝箱内置柏宝砚 / 共享渠道 `baibai_api_channels` 的副渠道明文 API Key），与同用户目录 `settings.json` 处于同一信任边界；副渠道建议使用低权限/限额 Key（配合 Vertex 主渠道跟随模式时保持 Vertex `API 版本` 为「自动」或 `v1beta1`，详见柏宝箱 Runbook），备份迁移或导出排障前按敏感凭据同等保护。
 
 ## 8. 大阶段收口时的部署交接
 
