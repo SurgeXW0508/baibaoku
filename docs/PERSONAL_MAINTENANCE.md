@@ -128,9 +128,10 @@ enableServerPluginsAutoUpdate: false
   - `allowUnverifiedMirrorDecision` 默认 `false`：安装、更新扩展与启动自更新时，必须有**权威线路**（直连 GitHub 或经本地/配置代理访问 GitHub）确认目标提交 SHA；若仅有第三方镜像可达而直连与代理均不可达，默认拒绝更新并提示“仅镜像可达，无法确认版本”。权威线路确认目标 SHA 后，一致的镜像仍可作为下载通道加速拉取 Git 对象。确需在无代理纯镜像环境临时放开时，可显式配置 `allowUnverifiedMirrorDecision: true`。
   - `cloudMirrorsEnabled` 默认 `false`：默认不拉取第三方云端镜像列表兜底。
   - 代理自动探测保持开启（`autoDetectProxy: true`），继续识别环境变量、酒馆 `requestProxy`、Git `http.proxy` 以及本机常用端口 `7890 / 7897 / 10809 / 1080`（兼容 mihomo 等代理场景），且探测阶段保证快速响应的镜像不会提前中止尚未返回的权威代理探测。
-- **个人分支保护与同名分支推断（方案 A）**：
-  - `personal/*` 分支（如 `personal/stable`）**必须**配置显式上游跟踪关系（`branch.<name>.merge`）；缺失上游跟踪或远端不存在同名分支时，一律报 `NO_UPSTREAM` / `BRANCH_PROTECTED` 拦截，游离 `HEAD` 同样报 `NO_UPSTREAM`。
-  - 非 `personal/*` 的普通合法分支若缺少 `branch.<name>.merge` 配置，仅当**权威线路**确认远端存在 `origin/<同名分支>` 时才允许按同名分支检查或更新，并在更新成功后自动补写 `branch.<name>.remote`、`branch.<name>.merge` 与 `remote.origin.fetch`（`system` 与 `builtin` 双后端一致）；若远端不存在同名分支，仍报 `NO_UPSTREAM` 拦截。
+- **个人分支保护、完整跟踪关系核验与同名分支推断（方案 A + `FX3-2`）**：
+  - `system` 与 `builtin` 双 Git 适配器统一同时读取并核验 `branch.<name>.remote` 与 `branch.<name>.merge`，由单一 `resolveTrackedBranch` 同时约束版本检查与实际更新：显式跟踪非 `origin` 远端（如 `upstream/...` 或本地非 `origin` 引用）在所有分支上一律报 `UNSUPPORTED_UPSTREAM` 拦截，绝不从 `origin` 误拉取或改写用户配置；仅保留 `merge` 缺失 `remote`、仅保留 `remote=origin` 缺失 `merge`、引用前缀不合法或重复配置等残缺状态一律报 `NO_UPSTREAM` 拦截（绝不落入同名分支推断）。
+  - `personal/*` 分支（如 `personal/stable`）**必须**具备完整的 `origin` 上游跟踪关系（`remote=origin` + `refs/heads/<branch>`，或 `remote=.` + `refs/remotes/origin/<branch>`），且跟踪分支名必须与当前 `personal/*` 分支一致；完全缺失上游或远端不存在该受保护分支时一律报 `NO_UPSTREAM` / `BRANCH_PROTECTED` 拦截，游离 `HEAD` 同样报 `NO_UPSTREAM`。
+  - 仅在 `branch.<name>.remote` 与 `branch.<name>.merge` **同时未配置**的非 `personal/*` 合法分支上，当**权威线路**确认远端存在 `origin/<同名分支>` 时才允许按同名分支检查或更新，并在更新成功后自动补写 `branch.<name>.remote`、`branch.<name>.merge` 与 `remote.origin.fetch`（`system` 与 `builtin` 双后端一致）；若远端不存在同名分支，仍报 `NO_UPSTREAM` 拦截。
   - 任何情况下（包括 `force: true` 强制更新）都**不会**自动切回远端默认分支（如 `main`），避免误切回未裁剪的上游主线；提示信息仅展示相对扩展路径（`extensions/<folder>` 或 `public/scripts/extensions/third-party/<folder>`）。
 - **主题懒加载耦合与自动兜底**：
   - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果以目录 `mtimeMs` 校验配合 30 秒 TTL 兜底缓存（`FX2-1`，禁用列表每次实时从设置解析；世界书 Tokenizer 桥接宏门控同步覆盖旧式 `<CHARIFNOTGROUP>/<GROUP>`，`FX2-2`，详以 ST canonical 规范为准）；检测到未安装/刚卸载/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动立即回退下发完整主题列表，避免单独禁用或卸载柏宝箱后无法切换主题。
