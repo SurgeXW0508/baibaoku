@@ -26,6 +26,7 @@ import { setSafeHeader } from './header-utils.js';
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
 const FAST_CHARACTER_CACHE_VERSION = 1;
+const FAST_CHARACTER_CACHE_SCHEMA = 2;
 const FAST_CHARACTER_CACHE_PAGE_SIZE = 1000;
 const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
 const SETTINGS_FAST_CONFIG_STORE = 'fast-config';
@@ -38,7 +39,7 @@ const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED = true;
 const DEFAULT_VERSION_ACCELERATION_ENABLED = true;
-const DEFAULT_CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = true;
+const DEFAULT_CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = false;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const FAST_SEARCH_FILE_CONCURRENCY = 4;
@@ -50,17 +51,15 @@ const FAST_SEARCH_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
 const FAST_SEARCH_CACHE_STORE = 'chats-fast-search';
 const FAST_SEARCH_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
 // Bump when the cached result object shape changes, to invalidate stale entries.
-const FAST_SEARCH_CACHE_SCHEMA = 1;
+const FAST_SEARCH_CACHE_SCHEMA = 2;
 const CHAT_BACKUP_CACHE_DATABASE = FAST_CHARACTER_CACHE_DATABASE;
 const CHAT_BACKUP_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
 const CHAT_BACKUP_CACHE_STORE = 'chat-backups-fast-list';
 const CHAT_BACKUP_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
-const CHAT_BACKUP_CACHE_SCHEMA = 1;
+const CHAT_BACKUP_CACHE_SCHEMA = 2;
 const CHAT_BACKUP_FILE_CONCURRENCY = 16;
 const CHAT_BACKUP_FILE_PREFIX = 'chat_';
 const CHAT_BACKUP_FILE_EXTENSION = '.jsonl';
-const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
-const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
 const SETTINGS_PAYLOAD_PERSIST_VERSION = 2;
@@ -141,20 +140,84 @@ function humanizedDateTime(timestamp = Date.now()) {
 }
 
 /**
- * Normalizes tags from V1/V2 char data structure.
+ * Normalizes tags from V1/V2 char data structure, matching ST's V2 vs V1 precedence.
  */
-function extractTags(data) {
-    let rawTags = data?.data?.tags || data?.tags || [];
+function extractTags(data, hasV2Data = false) {
+    let rawTags;
+    if (hasV2Data) {
+        rawTags = data?.data?.tags;
+    } else {
+        rawTags = data?.tags !== undefined ? data.tags : data?.data?.tags;
+    }
     if (typeof rawTags === 'string') {
         rawTags = rawTags.split(',').map(x => x.trim()).filter(x => x);
     }
     return Array.isArray(rawTags) ? rawTags : [];
 }
 
+function normalizeCharacterFav(rawFav) {
+    return rawFav === true || rawFav === 'true';
+}
+
+function buildV2DataForSizeCalculation(charData, name, tags, fav) {
+    const baseData = (charData?.data && typeof charData.data === 'object' && !Array.isArray(charData.data))
+        ? { ...charData.data }
+        : {};
+    const alternateGreetings = Array.isArray(charData?.alternate_greetings)
+        ? charData.alternate_greetings
+        : (typeof charData?.alternate_greetings === 'string'
+            ? [charData.alternate_greetings]
+            : (Array.isArray(baseData.alternate_greetings) ? baseData.alternate_greetings : []));
+
+    const v2Data = {
+        ...baseData,
+        name,
+        description: charData?.description || '',
+        personality: charData?.personality || '',
+        scenario: charData?.scenario || '',
+        first_mes: charData?.first_mes || '',
+        mes_example: charData?.mes_example || '',
+        creator_notes: charData?.creatorcomment || '',
+        system_prompt: '',
+        post_history_instructions: '',
+        tags,
+        creator: charData?.creator || '',
+        character_version: '',
+        alternate_greetings: alternateGreetings,
+        extensions: {
+            ...(baseData.extensions && typeof baseData.extensions === 'object' ? baseData.extensions : {}),
+            talkativeness: charData?.talkativeness || 0.5,
+            fav,
+            world: '',
+        },
+    };
+
+    return v2Data;
+}
+
+function calculateCharacterDataSize(data) {
+    return (data && typeof data === 'object' && !Array.isArray(data))
+        ? Object.values(data).reduce((acc, val) => acc + String(val).length, 0)
+        : 0;
+}
+
+function createEmptyCharacterChatStats() {
+    return {
+        chatSize: 0,
+        dateLastChat: 0,
+        chatDirMtime: 0,
+        files: {},
+    };
+}
+
 /**
  * Calculate chat statistics for a character
  */
 async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
+    if (!chatsDir) {
+        return createEmptyCharacterChatStats();
+    }
+
     const charDirName = filename.replace('.png', '');
     const charChatDir = path.join(chatsDir, charDirName);
 
@@ -166,16 +229,14 @@ async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
     try {
         chatDirStat = await fs.promises.stat(charChatDir);
     } catch (e) {
-        if (e.code === 'ENOENT') {
-            // No chat directory exists for this character
-            return {
-                chatSize: 0,
-                dateLastChat: 0,
-                chatDirMtime: 0,
-                files: {},
-            };
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+            return createEmptyCharacterChatStats();
         }
         throw e;
+    }
+
+    if (!chatDirStat.isDirectory()) {
+        return createEmptyCharacterChatStats();
     }
 
     // Fast path: if directory mtime hasn't changed, use cached stats
@@ -184,7 +245,16 @@ async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
     }
 
     // Directory changed, need to check files
-    const files = await fs.promises.readdir(charChatDir);
+    let files = [];
+    try {
+        files = await fs.promises.readdir(charChatDir);
+    } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+            return createEmptyCharacterChatStats();
+        }
+        throw e;
+    }
+
     const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
     const fileStats = {};
     const cachedFiles = cachedStats?.files || {};
@@ -192,7 +262,15 @@ async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
     // Check each file
     for (const file of jsonlFiles) {
         const filePath = path.join(charChatDir, file);
-        const stat = await fs.promises.stat(filePath);
+        let stat;
+        try {
+            stat = await fs.promises.stat(filePath);
+        } catch (e) {
+            if (e.code === 'ENOENT') {
+                continue;
+            }
+            throw e;
+        }
         const cached = cachedFiles[file];
 
         // Use cached data if file hasn't changed
@@ -220,52 +298,83 @@ async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
 }
 
 /**
- * Formats a character exactly like ST's `toShallow`, with real chat stats
+ * Formats a character with strict parity to ST's `processCharacter` + `toShallow`.
+ * Returns `null` when JSON is unparseable, non-object, or resolves an empty/nameless card.
  */
-async function formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedChatStats) {
-    let charData = {};
+export async function formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedChatStats) {
+    if (typeof rawDataStr !== 'string' || !rawDataStr) {
+        return null;
+    }
+
+    let charData;
     try {
         charData = JSON.parse(rawDataStr);
-    } catch (e) {
+    } catch {
         console.warn(`[baibaoku] Failed to parse JSON for character card: ${filename}`);
+        return null;
     }
 
-    let name = charData?.data?.name || charData?.name || filename.replace('.png', '');
-
-    if (filename.startsWith('default_')) {
-        const filenameBase = filename.replace('.png', '');
-        if (name === filenameBase || name.startsWith('default_')) {
-            name = name.replace(/^default_/, '');
-        }
+    if (!charData || typeof charData !== 'object' || Array.isArray(charData)) {
+        return null;
     }
+
+    const isV2 = charData.spec !== undefined;
+    if (isV2 && charData.data !== undefined && (!charData.data || typeof charData.data !== 'object' || Array.isArray(charData.data))) {
+        return null;
+    }
+    const hasV2Data = isV2 && charData.data !== undefined;
+
+    const rawName = hasV2Data
+        ? (typeof charData.data?.name === 'string' ? charData.data.name : '')
+        : (typeof charData.name === 'string' && charData.name
+            ? charData.name
+            : (typeof charData.data?.name === 'string' ? charData.data.name : ''));
+
+    if (!rawName || !rawName.trim()) {
+        return null;
+    }
+    const name = rawName;
+
+    const rawFav = isV2
+        ? (hasV2Data
+            ? (charData.data?.extensions?.fav !== undefined ? charData.data.extensions.fav : false)
+            : (charData.fav !== undefined ? charData.fav : false))
+        : (charData.fav ?? charData.data?.extensions?.fav ?? false);
+    const fav = normalizeCharacterFav(rawFav);
+
+    const tags = extractTags(charData, hasV2Data);
+    const v2DataForSize = isV2
+        ? (hasV2Data ? charData.data : undefined)
+        : buildV2DataForSizeCalculation(charData, name, tags, fav);
+    const dataSize = calculateCharacterDataSize(v2DataForSize);
 
     // Get real chat statistics
     const chatStats = await calculateCharacterChatStats(chatsDir, filename, cachedChatStats);
 
-    // Use chat field from character data, or generate default
-    const chatField = charData?.chat || `${name} - ${humanizedDateTime()}`;
+    const chatField = charData.chat ?? `${name} - ${humanizedDateTime()}`;
+    const createDate = charData.create_date || charData.data?.create_date || new Date(Math.round(stat.ctimeMs)).toISOString();
 
     return {
         shallow: true,
-        name: name,
+        name,
         avatar: filename,
         chat: chatField,
-        fav: charData?.data?.extensions?.fav || charData?.fav || false,
+        fav,
         date_added: stat.ctimeMs,
-        create_date: charData?.create_date || new Date(Math.round(stat.ctimeMs)).toISOString(),
+        create_date: createDate,
         date_last_chat: chatStats.dateLastChat,
         chat_size: chatStats.chatSize,
-        data_size: rawDataStr.length,
-        tags: extractTags(charData),
+        data_size: dataSize,
+        tags,
         data: {
-            name: name,
-            character_version: charData?.data?.character_version || '',
-            creator: charData?.data?.creator || charData?.creator || '',
-            creator_notes: charData?.data?.creator_notes || charData?.creatorcomment || '',
-            tags: extractTags(charData),
+            name: hasV2Data ? (charData.data?.name ?? '') : (isV2 ? '' : name),
+            character_version: hasV2Data ? (charData.data?.character_version ?? '') : '',
+            creator: hasV2Data ? (charData.data?.creator ?? '') : (isV2 ? '' : (charData.creator || '')),
+            creator_notes: hasV2Data ? (charData.data?.creator_notes ?? '') : (isV2 ? '' : (charData.creatorcomment || '')),
+            tags: hasV2Data ? extractTags(charData, true) : (isV2 ? [] : tags),
             extensions: {
-                fav: charData?.data?.extensions?.fav || charData?.fav || false,
-                world: charData?.data?.extensions?.world || '',
+                fav,
+                world: hasV2Data ? (charData.data?.extensions?.world ?? '') : '',
             },
         },
         // Internal: store chat stats for future incremental updates
@@ -281,10 +390,7 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
     const cache = userCaches.get(userHandle);
     const chatsDir = req.user?.directories?.chats;
 
-    // 2. Fast path: check if directories have changed via mtime
     let charactersDirStat = null;
-    let chatsDirStat = null;
-
     try {
         charactersDirStat = await fs.promises.stat(charactersDir);
     } catch (e) {
@@ -292,27 +398,19 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
         throw e;
     }
 
-    if (chatsDir) {
-        try {
-            chatsDirStat = await fs.promises.stat(chatsDir);
-        } catch (e) {
-            // chats directory doesn't exist, treat as mtime 0
-            chatsDirStat = { mtimeMs: 0 };
-        }
-    }
-
     const charactersChanged = cache.charactersDirMtime !== charactersDirStat.mtimeMs;
-    const chatsChanged = chatsDir && cache.chatsDirMtime !== (chatsDirStat?.mtimeMs || 0);
-
-    // If both directories haven't changed, return cached data immediately
-    if (!charactersChanged && !chatsChanged) {
-        return cache;
-    }
-
     const updatedItems = [];
     const deletedFilenames = [];
+    const reparsedFilenames = new Set();
 
-    // 3. Handle characters directory changes
+    const evictCachedCharacter = (filename) => {
+        if (cache.has(filename)) {
+            cache.delete(filename);
+            deletedFilenames.push(filename);
+        }
+    };
+
+    // 2. Handle characters directory changes
     if (charactersChanged) {
         let files = [];
         try {
@@ -338,27 +436,34 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
         const currentFileSet = new Set(pngFiles);
         for (const cachedFilename of cache.keys()) {
             if (!currentFileSet.has(cachedFilename)) {
-                cache.delete(cachedFilename);
-                deletedFilenames.push(cachedFilename);
+                evictCachedCharacter(cachedFilename);
             }
         }
 
         // Parse changed/new files
         const parsePromises = [];
         for (const result of statResults) {
-            if (result.error) continue;
+            if (result.error) {
+                if (result.error.code === 'ENOENT') {
+                    evictCachedCharacter(result.filename);
+                }
+                continue;
+            }
 
             const { filename, stat } = result;
             const cachedItem = cache.get(filename);
 
             // If not in cache, or file metadata differs
             if (!cachedItem || stat.mtimeMs !== cachedItem.mtime || stat.size !== cachedItem.size) {
+                reparsedFilenames.add(filename);
                 const filePath = path.join(charactersDir, filename);
                 const parseTask = async () => {
                     try {
                         const rawDataStr = await parse(filePath, 'png');
-                        if (rawDataStr) {
-                            const shallowData = await formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedItem?.data?._chatStats);
+                        const shallowData = rawDataStr
+                            ? await formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedItem?.data?._chatStats)
+                            : null;
+                        if (shallowData) {
                             const item = {
                                 mtime: stat.mtimeMs,
                                 size: stat.size,
@@ -366,9 +471,12 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
                             };
                             cache.set(filename, item);
                             updatedItems.push({ filename, item });
+                        } else {
+                            evictCachedCharacter(filename);
                         }
                     } catch (e) {
                         console.warn(`[baibaoku] Failed to parse character ${filename}:`, e.message);
+                        evictCachedCharacter(filename);
                     }
                 };
                 parsePromises.push(parseTask());
@@ -378,44 +486,46 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
         await Promise.all(parsePromises);
     }
 
-    // 4. Handle chats directory changes (independent of characters)
-    if (chatsChanged) {
-        let chatSubDirs = [];
-        try {
-            chatSubDirs = await fs.promises.readdir(chatsDir, { withFileTypes: true });
-        } catch (e) {
-            if (e.code !== 'ENOENT') {
-                console.warn(`[baibaoku] Failed to read chats directory:`, e.message);
-            }
-        }
-
-        // Find which character chats have changed
+    // 3. Always check per-character chats/<charName> directory mtime across cached characters.
+    // On POSIX/Linux, atomic writes inside chats/<charName>/<file>.jsonl update chats/<charName>/ mtimeMs,
+    // never top-level chats/ mtimeMs. Treat ENOENT as mtime 0 so deleted chat folders reset stats to 0.
+    if (chatsDir && cache.size > 0) {
         const chatUpdatePromises = [];
-        for (const dirent of chatSubDirs.filter(d => d.isDirectory())) {
-            const charName = dirent.name;
-            const avatarFilename = `${charName}.png`;
-            const cachedItem = cache.get(avatarFilename);
+        for (const [avatarFilename, cachedItem] of cache.entries()) {
+            if (reparsedFilenames.has(avatarFilename) || !cachedItem?.data) {
+                continue;
+            }
 
-            if (!cachedItem) continue; // No such character
-
+            const charName = avatarFilename.replace('.png', '');
             const chatSubDir = path.join(chatsDir, charName);
             const updateTask = async () => {
+                let currentChatDirMtime = 0;
                 try {
                     const chatDirStat = await fs.promises.stat(chatSubDir);
-                    const cachedChatStats = cachedItem.data?._chatStats;
-
-                    // Only update if this character's chat directory changed
-                    if (cachedChatStats?.chatDirMtime !== chatDirStat.mtimeMs) {
-                        const newChatStats = await calculateCharacterChatStats(chatsDir, avatarFilename, cachedChatStats);
-                        cachedItem.data.date_last_chat = newChatStats.dateLastChat;
-                        cachedItem.data.chat_size = newChatStats.chatSize;
-                        cachedItem.data._chatStats = newChatStats;
-                        updatedItems.push({ filename: avatarFilename, item: cachedItem });
+                    if (chatDirStat.isDirectory()) {
+                        currentChatDirMtime = chatDirStat.mtimeMs;
                     }
                 } catch (e) {
-                    if (e.code !== 'ENOENT') {
-                        console.warn(`[baibaoku] Failed to update chat stats for ${avatarFilename}:`, e.message);
+                    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') {
+                        console.warn(`[baibaoku] Failed to stat chat directory for ${avatarFilename}:`, e.message);
+                        return;
                     }
+                    currentChatDirMtime = 0;
+                }
+
+                const cachedChatStats = cachedItem.data._chatStats;
+                const previousChatDirMtime = cachedChatStats?.chatDirMtime ?? -1;
+                const needsResetForMissingDir = currentChatDirMtime === 0
+                    && (cachedItem.data.date_last_chat !== 0 || cachedItem.data.chat_size !== 0);
+
+                if (previousChatDirMtime !== currentChatDirMtime || needsResetForMissingDir) {
+                    const newChatStats = currentChatDirMtime === 0
+                        ? createEmptyCharacterChatStats()
+                        : await calculateCharacterChatStats(chatsDir, avatarFilename, cachedChatStats);
+                    cachedItem.data.date_last_chat = newChatStats.dateLastChat;
+                    cachedItem.data.chat_size = newChatStats.chatSize;
+                    cachedItem.data._chatStats = newChatStats;
+                    updatedItems.push({ filename: avatarFilename, item: cachedItem });
                 }
             };
             chatUpdatePromises.push(updateTask());
@@ -424,12 +534,13 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
         await Promise.all(chatUpdatePromises);
     }
 
-    // 5. Persist changes
-    await persistCacheChanges(req, manager, updatedItems, deletedFilenames);
+    // 4. Persist changes if anything changed
+    if (updatedItems.length || deletedFilenames.length) {
+        await persistCacheChanges(req, manager, updatedItems, deletedFilenames);
+    }
 
-    // 6. Update directory mtimes in cache
+    // 5. Update characters directory mtime in cache
     cache.charactersDirMtime = charactersDirStat.mtimeMs;
-    cache.chatsDirMtime = chatsDirStat?.mtimeMs || 0;
 
     return cache;
 }
@@ -446,6 +557,7 @@ async function loadPersistentCache(req, manager) {
             version: FAST_CHARACTER_CACHE_VERSION,
         });
 
+        const staleFilenames = [];
         let offset = 0;
         while (true) {
             const result = await manager.entries(req, FAST_CHARACTER_CACHE_DATABASE, FAST_CHARACTER_CACHE_STORE, {
@@ -459,6 +571,8 @@ async function loadPersistentCache(req, manager) {
                 const item = normalizePersistentCacheItem(entry.value);
                 if (item) {
                     cache.set(entry.key, item);
+                } else {
+                    staleFilenames.push(entry.key);
                 }
             }
 
@@ -466,6 +580,13 @@ async function loadPersistentCache(req, manager) {
                 break;
             }
             offset += FAST_CHARACTER_CACHE_PAGE_SIZE;
+        }
+
+        for (let index = 0; index < staleFilenames.length; index += FAST_CHARACTER_CACHE_PAGE_SIZE) {
+            const batch = staleFilenames.slice(index, index + FAST_CHARACTER_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.deleteMany(req, FAST_CHARACTER_CACHE_DATABASE, FAST_CHARACTER_CACHE_STORE, batch);
+            }
         }
     } catch (error) {
         console.warn('[baibaoku] Failed to load persistent character cache:', error.message);
@@ -485,7 +606,10 @@ async function persistCacheChanges(req, manager, updatedItems, deletedFilenames)
             if (batch.length) {
                 await manager.setMany(req, FAST_CHARACTER_CACHE_DATABASE, FAST_CHARACTER_CACHE_STORE, batch.map(({ filename, item }) => ({
                     key: filename,
-                    value: item,
+                    value: {
+                        schema: FAST_CHARACTER_CACHE_SCHEMA,
+                        ...item,
+                    },
                 })));
             }
         }
@@ -506,7 +630,15 @@ function normalizePersistentCacheItem(value) {
         return null;
     }
 
+    if (value.schema !== FAST_CHARACTER_CACHE_SCHEMA) {
+        return null;
+    }
+
     if (!Number.isFinite(value.mtime) || !value.data || typeof value.data !== 'object') {
+        return null;
+    }
+
+    if (typeof value.data.name !== 'string' || !value.data.name.trim()) {
         return null;
     }
 
@@ -676,14 +808,24 @@ function isPinnedRecentChat(chatFile, pinnedChats) {
 
 async function getFastRecentChatInfo(chatFile, withMetadata = false) {
     const parsedPath = path.parse(chatFile.filePath);
-    const stats = await fs.promises.stat(chatFile.filePath);
+    let stats;
+    try {
+        stats = await fs.promises.stat(chatFile.filePath);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return null;
+        }
+        throw error;
+    }
+
+    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
     const chatData = {
         file_id: parsedPath.name,
         file_name: parsedPath.base,
         file_size: bytes.format(stats.size) ?? '',
         chat_items: 0,
         mes: '[The chat is empty]',
-        last_mes: stats.mtimeMs,
+        last_mes: fallbackLastMes,
     };
 
     if (chatFile.groupId) {
@@ -696,11 +838,18 @@ async function getFastRecentChatInfo(chatFile, withMetadata = false) {
         return chatData;
     }
 
-    const fileHandle = await fs.promises.open(chatFile.filePath, 'r');
+    let fileHandle;
+    try {
+        fileHandle = await fs.promises.open(chatFile.filePath, 'r');
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return null;
+        }
+        throw error;
+    }
 
     try {
         const scan = await scanJsonlLineInfo(fileHandle, stats.size);
-        chatData.chat_items = Math.max(0, scan.lineCounter - 1);
 
         if (withMetadata && scan.firstLineLength > 0) {
             const firstLine = await readFileRangeAsUtf8(fileHandle, scan.firstLineStart, scan.firstLineLength);
@@ -710,20 +859,22 @@ async function getFastRecentChatInfo(chatFile, withMetadata = false) {
             }
         }
 
-        if (scan.lastLineLength <= 0) {
-            return chatData;
+        if (scan.lastLineLength > 0) {
+            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
+            const jsonData = parseJsonLine(lastLine);
+            if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+                chatData.chat_items = Math.max(0, scan.lineCounter - 1);
+                chatData.mes = jsonData.mes || '[The message is empty]';
+                chatData.last_mes = jsonData.send_date || fallbackLastMes;
+                return chatData;
+            }
         }
 
-        const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
-        const jsonData = parseJsonLine(lastLine);
-        if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
-            chatData.mes = jsonData.mes || '[The message is empty]';
-            chatData.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
-            return chatData;
-        }
-
-        console.warn('Found an invalid or corrupted chat file:', chatFile.filePath);
-        return null;
+        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat file:', chatFile.filePath);
+        chatData.chat_items = Math.max(scan.lineCounter - 2, 0);
+        chatData.mes = '[The message is empty]';
+        chatData.last_mes = fallbackLastMes;
+        return chatData;
     } finally {
         await fileHandle.close();
     }
@@ -763,11 +914,11 @@ async function scanJsonlLineInfo(fileHandle, fileSize) {
         position += bytesRead;
     }
 
-    if (lastByte !== 10) {
+    if (position > 0 && lastByte !== 10) {
         lineCounter += 1;
     }
 
-    const firstLineLength = firstLineEnd === -1 ? fileSize : firstLineEnd;
+    const firstLineLength = firstLineEnd === -1 ? position : firstLineEnd;
     const lastLineStartOffset = lastByte === 10 ? previousLineStart : lastLineStart;
     const lastLineEndOffset = lastByte === 10 ? Math.max(0, position - 1) : position;
 
@@ -833,16 +984,17 @@ async function mapFastSearchLimited(items, limit, mapper) {
 }
 
 /**
- * Scans a chat file and returns search metadata, mirroring ST's getChatSearchResult.
- * Returns null for corrupted/invalid chat files so the caller can skip them.
+ * Scans a chat file and returns search metadata, mirroring ST's getChatInfo degraded preview
+ * behavior so corrupted/blank trailing lines never hide an existing chat file.
  */
 async function computeFastSearchResult(chatFilePath, stats) {
     const parsedPath = path.parse(chatFilePath);
+    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
     const result = {
         file_name: parsedPath.name,
         file_size: bytes.format(stats.size) ?? '',
         message_count: 0,
-        last_mes: stats.mtimeMs,
+        last_mes: fallbackLastMes,
         preview_message: '[The chat is empty]',
     };
 
@@ -854,22 +1006,23 @@ async function computeFastSearchResult(chatFilePath, stats) {
 
     try {
         const scan = await scanJsonlLineInfo(fileHandle, stats.size);
-        result.message_count = Math.max(0, scan.lineCounter - 1);
 
-        if (scan.lastLineLength <= 0) {
-            return result;
+        if (scan.lastLineLength > 0) {
+            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
+            const jsonData = parseJsonLine(lastLine);
+            if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+                result.message_count = Math.max(0, scan.lineCounter - 1);
+                result.preview_message = getFastSearchPreviewMessage(jsonData.mes || '[The message is empty]');
+                result.last_mes = jsonData.send_date || fallbackLastMes;
+                return result;
+            }
         }
 
-        const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
-        const jsonData = parseJsonLine(lastLine);
-        if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
-            result.preview_message = getFastSearchPreviewMessage(jsonData.mes || '[The message is empty]');
-            result.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
-            return result;
-        }
-
-        console.warn('[baibaoku] Found an invalid or corrupted chat file:', chatFilePath);
-        return null;
+        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat file:', chatFilePath);
+        result.message_count = Math.max(scan.lineCounter - 2, 0);
+        result.preview_message = '[The message is empty]';
+        result.last_mes = fallbackLastMes;
+        return result;
     } finally {
         await fileHandle.close();
     }
@@ -888,8 +1041,11 @@ function normalizeFastSearchCacheEntry(value) {
         return null;
     }
 
-    // result may legitimately be null (cached marker for a corrupted file).
-    if (value.result !== null && (typeof value.result !== 'object' || Array.isArray(value.result))) {
+    if (!value.result || typeof value.result !== 'object' || Array.isArray(value.result)) {
+        return null;
+    }
+
+    if (typeof value.result.file_name !== 'string' || !value.result.file_name) {
         return null;
     }
 
@@ -908,6 +1064,7 @@ async function loadFastSearchCache(req, manager) {
             version: FAST_SEARCH_CACHE_VERSION,
         });
 
+        const staleKeys = [];
         let offset = 0;
         while (true) {
             const result = await manager.entries(req, FAST_SEARCH_CACHE_DATABASE, FAST_SEARCH_CACHE_STORE, {
@@ -921,6 +1078,8 @@ async function loadFastSearchCache(req, manager) {
                 const item = normalizeFastSearchCacheEntry(entry.value);
                 if (item) {
                     cache.set(entry.key, item);
+                } else {
+                    staleKeys.push(entry.key);
                 }
             }
 
@@ -928,6 +1087,13 @@ async function loadFastSearchCache(req, manager) {
                 break;
             }
             offset += FAST_SEARCH_CACHE_PAGE_SIZE;
+        }
+
+        for (let index = 0; index < staleKeys.length; index += FAST_SEARCH_CACHE_PAGE_SIZE) {
+            const batch = staleKeys.slice(index, index + FAST_SEARCH_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.deleteMany(req, FAST_SEARCH_CACHE_DATABASE, FAST_SEARCH_CACHE_STORE, batch);
+            }
         }
     } catch (error) {
         console.warn('[baibaoku] Failed to load persistent fast-search cache:', error.message);
@@ -999,10 +1165,16 @@ function normalizeChatBackupCacheEntry(value) {
         return null;
     }
 
+    if (typeof value.mes !== 'string' || typeof value.lastMes !== 'string' || !value.lastMes) {
+        return null;
+    }
+
     return {
         mtime: value.mtime,
         size: value.size,
         chatItems: value.chatItems,
+        mes: value.mes,
+        lastMes: value.lastMes,
     };
 }
 
@@ -1018,6 +1190,7 @@ async function loadChatBackupCache(req, manager) {
             version: CHAT_BACKUP_CACHE_VERSION,
         });
 
+        const staleKeys = [];
         let offset = 0;
         while (true) {
             const result = await manager.entries(req, CHAT_BACKUP_CACHE_DATABASE, CHAT_BACKUP_CACHE_STORE, {
@@ -1031,6 +1204,8 @@ async function loadChatBackupCache(req, manager) {
                 const item = normalizeChatBackupCacheEntry(entry.value);
                 if (item) {
                     cache.set(entry.key, item);
+                } else {
+                    staleKeys.push(entry.key);
                 }
             }
 
@@ -1038,6 +1213,13 @@ async function loadChatBackupCache(req, manager) {
                 break;
             }
             offset += CHAT_BACKUP_CACHE_PAGE_SIZE;
+        }
+
+        for (let index = 0; index < staleKeys.length; index += CHAT_BACKUP_CACHE_PAGE_SIZE) {
+            const batch = staleKeys.slice(index, index + CHAT_BACKUP_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.deleteMany(req, CHAT_BACKUP_CACHE_DATABASE, CHAT_BACKUP_CACHE_STORE, batch);
+            }
         }
     } catch (error) {
         console.warn('[baibaoku] Failed to load persistent chat backup cache:', error.message);
@@ -1091,15 +1273,37 @@ async function persistChatBackupChanges(req, manager, updatedEntries, deletedKey
     }
 }
 
-async function countChatBackupItems(filePath, fileSize) {
-    if (fileSize <= 0) {
-        return 0;
+async function computeChatBackupSummary(filePath, stats) {
+    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
+    if (stats.size <= 0) {
+        return {
+            chatItems: 0,
+            mes: '[The chat is empty]',
+            lastMes: fallbackLastMes,
+        };
     }
 
     const fileHandle = await fs.promises.open(filePath, 'r');
     try {
-        const scan = await scanJsonlLineInfo(fileHandle, fileSize);
-        return Math.max(0, scan.lineCounter - 1);
+        const scan = await scanJsonlLineInfo(fileHandle, stats.size);
+        if (scan.lastLineLength > 0) {
+            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
+            const lastObj = parseJsonLine(lastLine);
+            if (lastObj && (lastObj.name || lastObj.character_name || lastObj.chat_metadata)) {
+                return {
+                    chatItems: Math.max(0, scan.lineCounter - 1),
+                    mes: lastObj.mes || '[The message is empty]',
+                    lastMes: String(lastObj.send_date || fallbackLastMes),
+                };
+            }
+        }
+
+        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat backup file:', filePath);
+        return {
+            chatItems: Math.max(scan.lineCounter - 2, 0),
+            mes: '[The message is empty]',
+            lastMes: fallbackLastMes,
+        };
     } finally {
         await fileHandle.close();
     }
@@ -1134,28 +1338,32 @@ async function getFastChatBackupList(req, manager) {
             const filePath = path.join(backupDirectory, fileName);
             const stats = await fs.promises.stat(filePath);
             const cached = cache.get(fileName);
-            let chatItems;
+            let summary;
 
             if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
                 cacheHits += 1;
-                chatItems = cached.chatItems;
+                summary = cached;
             } else {
                 cacheMisses += 1;
-                chatItems = await countChatBackupItems(filePath, stats.size);
-                const item = {
+                const computed = await computeChatBackupSummary(filePath, stats);
+                summary = {
                     mtime: stats.mtimeMs,
                     size: stats.size,
-                    chatItems,
+                    chatItems: computed.chatItems,
+                    mes: computed.mes,
+                    lastMes: computed.lastMes,
                 };
-                cache.set(fileName, item);
-                updatedEntries.push({ key: fileName, item });
+                cache.set(fileName, summary);
+                updatedEntries.push({ key: fileName, item: summary });
             }
 
             return {
+                file_id: path.parse(fileName).name,
                 file_name: fileName,
                 file_size: bytes.format(stats.size) ?? '',
-                chat_items: chatItems,
-                last_mes: stats.mtimeMs,
+                chat_items: summary.chatItems,
+                mes: summary.mes,
+                last_mes: summary.lastMes,
             };
         },
     );
@@ -1198,22 +1406,21 @@ async function getFastChatBackupList(req, manager) {
 /**
  * Returns fast-search metadata for a chat file, reusing a cached result when the
  * file's mtime and size are unchanged so the full file scan can be skipped.
- * The stat() call is still required to detect changes (it is cheap relative to
- * scanning the whole file). On a miss, the recomputed entry is pushed to
- * `updatedEntries` so the caller can persist it.
  */
 async function getFastSearchResult(chatFilePath, cache, updatedEntries) {
     const stats = await fs.promises.stat(chatFilePath);
     const cached = cache.get(chatFilePath);
 
-    if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+    if (cached && cached.result && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
         return cached.result;
     }
 
     const result = await computeFastSearchResult(chatFilePath, stats);
-    const item = { mtime: stats.mtimeMs, size: stats.size, result };
-    cache.set(chatFilePath, item);
-    updatedEntries.push({ key: chatFilePath, item });
+    if (result) {
+        const item = { mtime: stats.mtimeMs, size: stats.size, result };
+        cache.set(chatFilePath, item);
+        updatedEntries.push({ key: chatFilePath, item });
+    }
     return result;
 }
 
@@ -1245,6 +1452,15 @@ function getFastSearchCharacterDirPrefix(req, avatarUrl) {
     const characterName = avatarUrl.replace('.png', '');
     // Mirror the join used in collectFastSearchCharacterFiles so cache keys match.
     return path.join(chatsDir, characterName) + path.sep;
+}
+
+function getFastSearchGroupChatsDirPrefix(req) {
+    const groupChatsDir = req.user?.directories?.groupChats;
+    if (!groupChatsDir) {
+        return null;
+    }
+
+    return path.join(groupChatsDir) + path.sep;
 }
 
 async function collectFastSearchGroupFiles(req, groupId) {
@@ -1323,8 +1539,10 @@ async function getFastSearch(req, manager) {
     let invalidFiles = 0;
     for (const item of settled) {
         if (item.status === 'rejected') {
-            invalidFiles += 1;
-            console.warn('[baibaoku] Failed to read fast-search metadata:', item.reason);
+            if (item.reason?.code !== 'ENOENT') {
+                invalidFiles += 1;
+                console.warn('[baibaoku] Failed to read fast-search metadata:', item.reason);
+            }
             continue;
         }
         if (item.value) {
@@ -1332,17 +1550,23 @@ async function getFastSearch(req, manager) {
         }
     }
 
-    // Garbage-collect cache entries for chats that no longer exist. Only safe for
-    // the character branch, where chatFiles is the authoritative list for a single
-    // directory; group chats share a flat directory, so prefix-based GC would be
-    // unsafe and is skipped (those entries are bounded and simply linger).
     const deletedKeys = [];
+    const presentKeys = new Set(chatFiles);
     if (!groupId) {
-        const presentKeys = new Set(chatFiles);
         const dirPrefix = getFastSearchCharacterDirPrefix(req, avatarUrl);
         if (dirPrefix) {
             for (const key of cache.keys()) {
                 if (key.startsWith(dirPrefix) && !presentKeys.has(key)) {
+                    cache.delete(key);
+                    deletedKeys.push(key);
+                }
+            }
+        }
+    } else {
+        const groupChatsDirPrefix = getFastSearchGroupChatsDirPrefix(req);
+        if (groupChatsDirPrefix) {
+            for (const key of cache.keys()) {
+                if (key.startsWith(groupChatsDirPrefix) && !presentKeys.has(key) && !fs.existsSync(key)) {
                     cache.delete(key);
                     deletedKeys.push(key);
                 }
@@ -1363,324 +1587,6 @@ async function getFastSearch(req, manager) {
             invalidFiles,
             cacheMisses: updatedEntries.length,
             cacheGc: deletedKeys.length,
-        },
-    };
-}
-
-async function getFastChatGet(req) {
-    const userHandle = req.user?.profile?.handle;
-    if (!userHandle) {
-        const error = new Error('Unauthorized');
-        error.status = 401;
-        throw error;
-    }
-
-    const source = String(req.body?.source || '');
-    const mode = req.body?.mode === 'full' ? 'full' : 'initial';
-    const originalRequest = req.body?.originalRequest && typeof req.body.originalRequest === 'object'
-        ? req.body.originalRequest
-        : {};
-    const thresholdBytes = normalizeFastChatThresholdBytes(req.body?.thresholdBytes);
-    const initialMessages = normalizeFastChatInitialMessages(req.body?.initialMessages);
-    const chatFile = resolveFastChatFile(req, source, originalRequest);
-    const startedAt = Date.now();
-
-    if (!chatFile?.filePath) {
-        const error = new Error('Unsupported chat source');
-        error.status = 400;
-        throw error;
-    }
-
-    let stats = null;
-    try {
-        stats = await fs.promises.stat(chatFile.filePath);
-    } catch {
-        return buildFastChatResponse({
-            kind: 'complete',
-            chat: [],
-            source,
-            chatKey: chatFile.chatKey,
-            stats: { size: 0, mtimeMs: 0 },
-            totalMessages: 0,
-            returnedMessages: 0,
-            messageStartIndex: 0,
-            elapsedMs: Date.now() - startedAt,
-        });
-    }
-
-    if (stats.size <= 0) {
-        return buildFastChatResponse({
-            kind: 'complete',
-            chat: [],
-            source,
-            chatKey: chatFile.chatKey,
-            stats,
-            totalMessages: 0,
-            returnedMessages: 0,
-            messageStartIndex: 0,
-            elapsedMs: Date.now() - startedAt,
-        });
-    }
-
-    if (mode === 'full' || stats.size <= thresholdBytes) {
-        const chat = await readFullJsonlChat(chatFile.filePath);
-        const totalMessages = countChatMessages(chat);
-        return buildFastChatResponse({
-            kind: mode === 'full' ? 'full' : 'complete',
-            chat,
-            source,
-            chatKey: chatFile.chatKey,
-            stats,
-            totalMessages,
-            returnedMessages: totalMessages,
-            messageStartIndex: 0,
-            elapsedMs: Date.now() - startedAt,
-        });
-    }
-
-    const partial = await readPartialJsonlChat(chatFile.filePath, stats.size, initialMessages);
-    return buildFastChatResponse({
-        kind: 'partial',
-        chat: partial.chat,
-        source,
-        chatKey: chatFile.chatKey,
-        stats,
-        totalMessages: partial.totalMessages,
-        returnedMessages: partial.returnedMessages,
-        messageStartIndex: partial.messageStartIndex,
-        elapsedMs: Date.now() - startedAt,
-    });
-}
-
-function normalizeFastChatThresholdBytes(value) {
-    const threshold = Number(value);
-    return Number.isFinite(threshold) && threshold > 0
-        ? Math.floor(threshold)
-        : FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES;
-}
-
-function normalizeFastChatInitialMessages(value) {
-    const count = Number(value);
-    return Number.isInteger(count) && count > 0
-        ? Math.min(count, 500)
-        : FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES;
-}
-
-function resolveFastChatFile(req, source, originalRequest) {
-    const directories = req.user?.directories || {};
-
-    if (source === '/api/chats/get') {
-        const chatsDir = directories.chats;
-        const avatarUrl = String(originalRequest.avatar_url || '');
-        const fileName = String(originalRequest.file_name || '');
-        if (!chatsDir || !avatarUrl || !fileName) {
-            return null;
-        }
-
-        const characterDir = sanitizeFastChatPathSegment(avatarUrl.replace('.png', ''));
-        const chatFileName = sanitizeFastChatPathSegment(`${fileName}.jsonl`);
-        const filePath = path.join(chatsDir, characterDir, chatFileName);
-        if (!isFastChatPathUnderParent(chatsDir, filePath)) {
-            return null;
-        }
-
-        return {
-            filePath,
-            chatKey: getFastChatKey(req, filePath),
-        };
-    }
-
-    if (source === '/api/chats/group/get') {
-        const groupChatsDir = directories.groupChats;
-        const id = String(originalRequest.id || '');
-        if (!groupChatsDir || !id) {
-            return null;
-        }
-
-        const filePath = path.join(groupChatsDir, sanitizeFastChatPathSegment(`${id}.jsonl`));
-        if (!isFastChatPathUnderParent(groupChatsDir, filePath)) {
-            return null;
-        }
-
-        return {
-            filePath,
-            chatKey: getFastChatKey(req, filePath),
-        };
-    }
-
-    return null;
-}
-
-function sanitizeFastChatPathSegment(value) {
-    return path.basename(String(value || ''))
-        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
-        .trim();
-}
-
-function isFastChatPathUnderParent(parent, target) {
-    const relative = path.relative(path.resolve(parent), path.resolve(target));
-    return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
-}
-
-function getFastChatKey(req, filePath) {
-    const root = req.user?.directories?.root;
-    const relative = root
-        ? path.relative(root, filePath)
-        : filePath;
-    return relative.replaceAll(path.sep, '/');
-}
-
-async function readFullJsonlChat(filePath) {
-    const text = await fs.promises.readFile(filePath, 'utf8');
-    if (!text) {
-        return [];
-    }
-
-    return text
-        .split('\n')
-        .map(line => parseJsonLine(line))
-        .filter(Boolean);
-}
-
-async function readPartialJsonlChat(filePath, fileSize, initialMessages) {
-    const fileHandle = await fs.promises.open(filePath, 'r');
-
-    try {
-        const scan = await scanJsonlTailRanges(fileHandle, fileSize, initialMessages);
-        const firstLineText = scan.firstLineRange
-            ? await readFileRangeAsUtf8(fileHandle, scan.firstLineRange.start, scan.firstLineRange.length)
-            : '';
-        const firstJson = parseJsonLine(firstLineText);
-        const hasHeader = Boolean(firstJson?.chat_metadata && typeof firstJson.chat_metadata === 'object');
-        const tailRanges = hasHeader ? scan.tailMessageRanges : scan.tailAllRanges;
-        const totalMessages = hasHeader
-            ? Math.max(0, scan.lineCounter - 1)
-            : scan.lineCounter;
-        const messageStartIndex = Math.max(0, totalMessages - tailRanges.length);
-        const chat = [];
-
-        if (hasHeader) {
-            chat.push(firstJson);
-        }
-
-        for (const range of tailRanges) {
-            const text = await readFileRangeAsUtf8(fileHandle, range.start, range.length);
-            const json = parseJsonLine(text);
-            if (json) {
-                chat.push(json);
-            }
-        }
-
-        return {
-            chat,
-            totalMessages,
-            returnedMessages: tailRanges.length,
-            messageStartIndex,
-        };
-    } finally {
-        await fileHandle.close();
-    }
-}
-
-async function scanJsonlTailRanges(fileHandle, fileSize, tailLimit) {
-    const buffer = Buffer.allocUnsafe(FAST_RECENT_CHAT_READ_BUFFER_SIZE);
-    let lineCounter = 0;
-    let position = 0;
-    let lineStart = 0;
-    let firstLineRange = null;
-    let lastByte = null;
-    const tailAllRanges = [];
-    const tailMessageRanges = [];
-
-    const pushTail = (queue, range) => {
-        queue.push(range);
-        while (queue.length > tailLimit) {
-            queue.shift();
-        }
-    };
-
-    const finishLine = (end) => {
-        const range = {
-            start: lineStart,
-            length: Math.max(0, end - lineStart),
-        };
-
-        if (!firstLineRange) {
-            firstLineRange = range;
-        }
-
-        if (range.length > 0) {
-            pushTail(tailAllRanges, range);
-            if (lineCounter > 0) {
-                pushTail(tailMessageRanges, range);
-            }
-        }
-
-        lineCounter += 1;
-        lineStart = end + 1;
-    };
-
-    while (position < fileSize) {
-        const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, position);
-        if (bytesRead === 0) {
-            break;
-        }
-
-        const chunk = buffer.subarray(0, bytesRead);
-        let searchOffset = 0;
-        let newlineOffset;
-
-        while ((newlineOffset = chunk.indexOf(10, searchOffset)) !== -1) {
-            finishLine(position + newlineOffset);
-            searchOffset = newlineOffset + 1;
-        }
-
-        lastByte = chunk[bytesRead - 1];
-        position += bytesRead;
-    }
-
-    if (lastByte !== 10 && lineStart < fileSize) {
-        finishLine(fileSize);
-    }
-
-    return {
-        lineCounter,
-        firstLineRange,
-        tailAllRanges,
-        tailMessageRanges,
-    };
-}
-
-function countChatMessages(chat) {
-    if (!Array.isArray(chat) || chat.length === 0) {
-        return 0;
-    }
-
-    return chat[0]?.chat_metadata ? Math.max(0, chat.length - 1) : chat.length;
-}
-
-function buildFastChatResponse({ kind, chat, source, chatKey, stats, totalMessages, returnedMessages, messageStartIndex, elapsedMs }) {
-    const fileSize = Number(stats?.size || 0);
-    const mtimeMs = Number(stats?.mtimeMs || 0);
-    const startIndex = Math.max(0, Number(messageStartIndex || 0));
-    const returned = Math.max(0, Number(returnedMessages || 0));
-
-    return {
-        ok: true,
-        kind,
-        chat,
-        meta: {
-            partial: kind === 'partial',
-            chatKey,
-            source,
-            fileSize,
-            mtimeMs,
-            version: `${fileSize}:${mtimeMs}`,
-            totalMessages: Math.max(0, Number(totalMessages || 0)),
-            returnedMessages: returned,
-            messageStartIndex: startIndex,
-            messageEndIndexExclusive: startIndex + returned,
-            elapsedMs,
         },
     };
 }
@@ -3394,7 +3300,7 @@ async function getSettingsFastConfig(req, manager) {
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
         extensionManifestBundleEnabled: value.extensionManifestBundleEnabled !== false,
         versionAccelerationEnabled: value.versionAccelerationEnabled !== false,
-        chatKeyboardScanReductionEnabled: value.chatKeyboardScanReductionEnabled !== false,
+        chatKeyboardScanReductionEnabled: false,
     };
 }
 
@@ -3430,9 +3336,7 @@ async function setSettingsFastConfig(req, manager) {
         versionAccelerationEnabled: req.body?.versionAccelerationEnabled === undefined
             ? current.versionAccelerationEnabled !== false
             : req.body.versionAccelerationEnabled !== false,
-        chatKeyboardScanReductionEnabled: req.body?.chatKeyboardScanReductionEnabled === undefined
-            ? current.chatKeyboardScanReductionEnabled !== false
-            : req.body.chatKeyboardScanReductionEnabled !== false,
+        chatKeyboardScanReductionEnabled: false,
     };
 
     await manager.set(
@@ -3555,10 +3459,23 @@ export function makeEarlyBridgeScript(options = {}) {
     const lazyThemeLoadingEnabled = settingsAccelerationEnabled && options.lazyThemeLoadingEnabled !== false;
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
+    const progressiveChatLoadingEnabled = false;
     const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
     const extensionManifestBundleEnabled = options.extensionManifestBundleEnabled !== false;
     const versionAccelerationEnabled = options.versionAccelerationEnabled !== false;
-    const chatKeyboardScanReductionEnabled = options.chatKeyboardScanReductionEnabled !== false;
+    const chatKeyboardScanReductionEnabled = false;
+    const initialFastConfig = {
+        ...options,
+        settingsAccelerationEnabled,
+        lazyThemeLoadingEnabled,
+        characterListAccelerationEnabled,
+        recentChatListAccelerationEnabled,
+        progressiveChatLoadingEnabled,
+        tokenizerBulkCountEnabled,
+        extensionManifestBundleEnabled,
+        versionAccelerationEnabled,
+        chatKeyboardScanReductionEnabled,
+    };
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -3581,7 +3498,7 @@ export function makeEarlyBridgeScript(options = {}) {
   var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
   var EXTENSION_MANIFEST_BUNDLE_ENABLED = ${JSON.stringify(extensionManifestBundleEnabled)};
   var VERSION_ACCELERATION_ENABLED = ${JSON.stringify(versionAccelerationEnabled)};
-  var CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = ${JSON.stringify(chatKeyboardScanReductionEnabled)};
+  var INITIAL_FAST_CONFIG = ${JSON.stringify(initialFastConfig)};
   var SETTINGS_CACHE_READONLY_PATHS = ${JSON.stringify(SETTINGS_CACHE_READONLY_PATHS)};
   var SETTINGS_CACHE_INVALIDATE_PREFIXES = ${JSON.stringify(SETTINGS_CACHE_INVALIDATE_PREFIXES)};
 
@@ -3601,6 +3518,7 @@ export function makeEarlyBridgeScript(options = {}) {
   state.installed = true;
   state.version = VERSION;
   state.installedAt = Date.now();
+  state.initialFastConfig = Object.assign({}, INITIAL_FAST_CONFIG);
   state.fastVersionPath = FAST_VERSION;
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
@@ -3621,7 +3539,7 @@ export function makeEarlyBridgeScript(options = {}) {
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
   state.settingsGetCacheVersion = typeof state.settingsGetCacheVersion === 'number' ? state.settingsGetCacheVersion : 0;
-  state.settingsSaveCache = state.settingsSaveCache || null;
+  state.settingsSaveCache = null;
   state.settingsSavePending = null;
   state.settingsRequestHeaders = state.settingsRequestHeaders || null;
   state.lazyThemesArray = state.lazyThemesArray || null;
@@ -3632,239 +3550,18 @@ export function makeEarlyBridgeScript(options = {}) {
   state.extensionManifestBundleCache = state.extensionManifestBundleCache || null;
   state.extensionManifestBundlePending = null;
 
-  // ---------------------------------------------------------------------------
-  // 聊天键盘扫描合并 (Chat keyboard scan reduction)
-  //
-  // SillyTavern 原生 scripts/keyboard.js 在 document.body 上挂了一个
-  // MutationObserver(subtree + class 属性),任何元素的 class 变化都会让它对
-  // 该节点子树重新扫描全部可交互控件(28 个 querySelectorAll + matches),用于设
-  // 置 Tab 焦点顺序。进入角色卡时大量消息会批量切换 class,导致这个 observer 被
-  // 逐条同步唤醒,造成明显卡顿(实测进卡阶段约 170ms)。
-  //
-  // 这里在 ST 主脚本求值之前包装全局 MutationObserver 构造函数,做两件事:
-  //   Layer 2 (始终开启): 把命中的那个 observer 的回调合并到下一帧,一帧内的多
-  //           次变化只触发一次扫描。功能完全不变(tabindex 只服务 Tab/Enter,本
-  //           就是异步交互),只是把“逐条同步全扫”变成“成批扫一次”。
-  //   Layer 3 (开关控制): 直接丢弃发生在 #chat 内部的纯 class 变化。这是开销的
-  //           绝对大头。代价仅是聊天区内联按钮的 Tab 键可达性会退化——点击/触摸
-  //           完全不受影响。开关关闭时退回到只有 Layer 2 的安全行为。
-  //
-  // 只精准命中 keyboard.js 那一个 observer(body + subtree + class 属性过滤),
-  // 其它所有 MutationObserver 原样放行,零误伤。任何异常都会静默降级为原生行为。
-  // ---------------------------------------------------------------------------
-  state.chatKeyboardScanReductionEnabled = CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED;
+  // SillyTavern Core (public/scripts/keyboard.js) natively owns selector joining,
+  // scroll-reset WeakSet deduplication, and rAF mutation coalescing.
+  // Never wrap window.MutationObserver; keep read-only compatibility stubs only.
+  state.keyboardObserverCoalescingInstalled = false;
+  state.chatKeyboardScanReductionEnabled = false;
   state.isChatKeyboardScanReductionEnabled = function () {
-    return state.chatKeyboardScanReductionEnabled !== false;
+    return false;
   };
-  state.setChatKeyboardScanReductionEnabled = function (enabled) {
-    state.chatKeyboardScanReductionEnabled = Boolean(enabled);
-    return state.chatKeyboardScanReductionEnabled;
+  state.setChatKeyboardScanReductionEnabled = function () {
+    state.chatKeyboardScanReductionEnabled = false;
+    return false;
   };
-
-  (function installKeyboardObserverCoalescing() {
-    try {
-      var NativeMutationObserver = window.MutationObserver;
-      if (typeof NativeMutationObserver !== 'function' || NativeMutationObserver.__baibaokuWrapped) {
-        return;
-      }
-
-      var schedule = (typeof window.requestAnimationFrame === 'function')
-        ? function (cb) { return window.requestAnimationFrame(cb); }
-        : function (cb) { return setTimeout(cb, 16); };
-
-      // 判断一个 observe() 调用是否就是 keyboard.js 那个全局 observer。
-      function isKeyboardObserverTarget(target, options) {
-        if (target !== document.body || !options || !options.subtree) {
-          return false;
-        }
-        if (!options.attributes && !options.attributeFilter) {
-          return false;
-        }
-        var filter = options.attributeFilter;
-        if (Array.isArray(filter)) {
-          return filter.indexOf('class') !== -1;
-        }
-        // attributes:true 且未限定 filter,也会收到 class 变化。
-        return options.attributes === true;
-      }
-
-      function isInsideChat(node) {
-        var el = (node && node.nodeType === 1) ? node : (node ? node.parentElement : null);
-        // closest 在元素上一定存在;#chat 是聊天消息容器。
-        return !!(el && typeof el.closest === 'function' && el.closest('#chat'));
-      }
-
-      // 过滤一批 mutation:丢弃 #chat 内部的纯 class 变化(Layer 3)。
-      // 返回需要转发给原始回调的 mutation 数组。
-      function filterChatClassMutations(mutations) {
-        var kept = [];
-        for (var i = 0; i < mutations.length; i++) {
-          var m = mutations[i];
-          var isClassAttr = m.type === 'attributes' && m.attributeName === 'class';
-          if (isClassAttr && isInsideChat(m.target)) {
-            continue;
-          }
-          kept.push(m);
-        }
-        return kept;
-      }
-
-      function WrappedMutationObserver(callback) {
-        if (typeof callback !== 'function') {
-          return new NativeMutationObserver(callback);
-        }
-
-        var self = this;
-        var isKeyboardObserver = false;
-        var pendingFlush = 0;
-        var queued = [];
-
-        // 一帧内积压的独立扫描根(attribute 目标 + childList 新增节点)超过该值时,
-        // 逐节点扫描的总成本必然超过对 document.body 的一次全量扫描,直接降级整扫。
-        var FULL_SCAN_THRESHOLD = 40;
-
-        // keyboard.js 的 initializeScrollResetBehaviors 对 .scroll-reset-container
-        // 不去重地重复 addEventListener('focusout')。整扫会以 body 为根命中全部
-        // 容器,每次降级都累积一份重复监听。整扫期间把“已见过”的容器类名临时
-        // 摘掉(该函数靠 querySelectorAll 按类名找目标),结束后恢复;首次见到
-        // 的容器不隐藏(可能尚未初始化,漏挂比重复挂更糟),记入 seen。
-        var scrollResetSeen = (typeof WeakSet === 'function') ? new WeakSet() : null;
-
-        function hideSeenScrollResetContainers() {
-          if (!scrollResetSeen || !document.body || typeof document.body.querySelectorAll !== 'function') {
-            return [];
-          }
-          var hidden = [];
-          var containers = document.body.querySelectorAll('.scroll-reset-container');
-          for (var i = 0; i < containers.length; i++) {
-            var container = containers[i];
-            if (scrollResetSeen.has(container)) {
-              container.classList.remove('scroll-reset-container');
-              hidden.push(container);
-            } else {
-              scrollResetSeen.add(container);
-            }
-          }
-          return hidden;
-        }
-
-        function flush() {
-          pendingFlush = 0;
-          var batch = queued;
-          queued = [];
-          if (!batch.length) {
-            return;
-          }
-
-          // 去重:同一 target 在一帧内的多次 class 变化只需扫一次;childList 原样保留。
-          var deduped = [];
-          var seenAttrTargets = (typeof Set === 'function') ? new Set() : null;
-          var rootCount = 0;
-          for (var i = 0; i < batch.length; i++) {
-            var m = batch[i];
-            if (m.type === 'attributes') {
-              if (seenAttrTargets) {
-                if (seenAttrTargets.has(m.target)) {
-                  continue;
-                }
-                seenAttrTargets.add(m.target);
-              }
-              deduped.push(m);
-              rootCount += 1;
-            } else {
-              deduped.push(m);
-              rootCount += (m.addedNodes && m.addedNodes.length) || 0;
-            }
-          }
-
-          // 大批量降级:mutation 风暴(主题切换、批量渲染)下,keyboard.js 会对每个
-          // 变动节点各跑一遍全部选择器(N 次 querySelectorAll + matches)。改为转发一条
-          // 合成 childList 记录,让它对 document.body 整体扫一次——覆盖范围是原批次的
-          // 超集,成本从 N 次子树扫描降为 1 次全文档扫描。
-          var hiddenContainers = [];
-          if (rootCount > FULL_SCAN_THRESHOLD && document.body) {
-            deduped = [{
-              type: 'childList',
-              target: document.body,
-              addedNodes: [document.body],
-              removedNodes: [],
-              attributeName: null,
-            }];
-            hiddenContainers = hideSeenScrollResetContainers();
-          }
-
-          try {
-            callback.call(self, deduped, self);
-          } catch (_) {
-            // 原始回调内部错误不应影响包装层。
-          } finally {
-            if (hiddenContainers.length) {
-              for (var j = 0; j < hiddenContainers.length; j++) {
-                hiddenContainers[j].classList.add('scroll-reset-container');
-              }
-              // 排掉本次隐藏/恢复以及回调自身 DOM 写入产生的 class 变动回声,
-              // 避免下一帧对已处理元素再跑一轮空扫。同步 JS 期间不会有其它来源
-              // 的 mutation 混入,丢弃是安全的。
-              observer.takeRecords();
-            }
-          }
-        }
-
-        var observer = new NativeMutationObserver(function (mutations, obs) {
-          // 非目标 observer:行为完全透传,不做任何处理。
-          if (!isKeyboardObserver) {
-            callback.call(self, mutations, obs);
-            return;
-          }
-
-          // Layer 3(开关控制):丢弃 #chat 内部的纯 class 变化(开销大头)。
-          // 开关关闭时不丢弃,仅保留 Layer 2 合并。
-          var forwarded = state.isChatKeyboardScanReductionEnabled()
-            ? filterChatClassMutations(mutations)
-            : mutations;
-          if (!forwarded.length) {
-            return;
-          }
-
-          // Layer 2(始终开启):合并到下一帧,一帧内只触发一次扫描。
-          for (var i = 0; i < forwarded.length; i++) {
-            queued.push(forwarded[i]);
-          }
-          if (!pendingFlush) {
-            pendingFlush = schedule(flush);
-          }
-        });
-
-        // 暴露与原生一致的接口,并在 observe 时识别目标。
-        this.observe = function (target, options) {
-          if (isKeyboardObserverTarget(target, options)) {
-            isKeyboardObserver = true;
-          }
-          return observer.observe(target, options);
-        };
-        this.disconnect = function () {
-          queued = [];
-          if (pendingFlush) {
-            // rAF/timeout 句柄无法可靠区分;flush 会因 queued 为空而早退。
-            pendingFlush = 0;
-          }
-          return observer.disconnect();
-        };
-        this.takeRecords = function () {
-          var pending = queued;
-          queued = [];
-          return observer.takeRecords().concat(pending);
-        };
-      }
-
-      WrappedMutationObserver.prototype = NativeMutationObserver.prototype;
-      WrappedMutationObserver.__baibaokuWrapped = true;
-      window.MutationObserver = WrappedMutationObserver;
-      state.keyboardObserverCoalescingInstalled = true;
-    } catch (error) {
-      state.keyboardObserverCoalescingError = (error && error.message) ? error.message : String(error);
-    }
-  })();
 
   function clearExtensionManifestBundleCache(reason) {
     state.extensionManifestBundleCache = null;
@@ -4101,6 +3798,8 @@ export function makeEarlyBridgeScript(options = {}) {
     state.lastSaveInvalidationReason = reason || 'unknown';
     state.lastSaveInvalidatedAt = Date.now();
   }
+
+  state.clearSettingsSaveCache = clearSettingsSaveCache;
 
   function makeCachedSettingsGetResponse(cache, source) {
     var headers = new Headers(cache.headers || undefined);
@@ -4570,28 +4269,23 @@ export function makeEarlyBridgeScript(options = {}) {
     return state.settingsGetCache;
   }
 
-  async function cacheSettingsSaveResponse(response, saveKey) {
-    var text = await response.clone().text();
+  async function snapshotSettingsSaveResponse(clonedResponse) {
+    var text = await clonedResponse.text();
     var headers = {};
-    response.headers.forEach(function (value, key) {
+    clonedResponse.headers.forEach(function (value, key) {
       if (!/^content-encoding$/i.test(key) && !/^content-length$/i.test(key)) {
         headers[key] = value;
       }
     });
-    var cache = {
-      key: saveKey,
+    return {
       text: text,
       headers: headers,
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok,
-      skipped: response.headers.get('x-baibaoku-save-skipped') === 'true',
+      status: clonedResponse.status,
+      statusText: clonedResponse.statusText,
+      ok: clonedResponse.ok,
+      skipped: clonedResponse.headers.get('x-baibaoku-save-skipped') === 'true',
       savedAt: Date.now(),
     };
-    if (response.ok) {
-      state.settingsSaveCache = cache;
-    }
-    return cache;
   }
 
   async function getReplayBody(input, init, method) {
@@ -4619,21 +4313,6 @@ export function makeEarlyBridgeScript(options = {}) {
     if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
     if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body);
     return null;
-  }
-
-  function hashStringForSaveKey(text) {
-    var hash = 2166136261;
-    for (var i = 0; i < text.length; i += 1) {
-      hash ^= text.charCodeAt(i);
-      hash = Math.imul(hash, 16777619);
-    }
-    return (hash >>> 0).toString(36);
-  }
-
-  async function getSettingsSaveKey(body) {
-    var text = await bodyToText(body);
-    if (text === null) return null;
-    return String(text.length) + ':' + hashStringForSaveKey(text);
   }
 
   async function gzipFastSaveInit(init) {
@@ -4767,9 +4446,8 @@ export function makeEarlyBridgeScript(options = {}) {
       }
       if (originalResponse && originalResponse.ok && shouldInvalidateSettingsGetCache(url, method)) {
         clearSettingsGetCache('mutation:' + url.pathname);
-        if (url.pathname === '/api/settings/save') {
-          clearSettingsSaveCache('mutation:' + url.pathname);
-        }
+        state.settingsSavePending = null;
+        clearSettingsSaveCache('mutation:' + url.pathname);
       }
       return originalResponse;
     }
@@ -4809,43 +4487,49 @@ export function makeEarlyBridgeScript(options = {}) {
       }
 
       if (route.kind === 'save') {
-        var saveKey = await getSettingsSaveKey(fastInit.body);
-        if (saveKey && state.settingsSavePending && state.settingsSavePending.key === saveKey) {
+        var bodyText = await bodyToText(fastInit.body);
+        if (typeof bodyText === 'string' && state.settingsSavePending && state.settingsSavePending.bodyText === bodyText) {
           state.requests.frontendCache += 1;
           state.requests.saveFrontendCache += 1;
-          var pendingSaveCache = await state.settingsSavePending.promise;
-          if (pendingSaveCache && pendingSaveCache.ok) {
-            return makeCachedSettingsSaveResponse(pendingSaveCache, 'pending');
+          var pendingSaveSnapshot = await state.settingsSavePending.promise;
+          if (pendingSaveSnapshot && pendingSaveSnapshot.ok) {
+            return makeCachedSettingsSaveResponse(pendingSaveSnapshot, 'pending');
           }
           return callOriginal(input, init);
         }
-        if (saveKey && !state.settingsSavePending && state.settingsSaveCache && state.settingsSaveCache.key === saveKey) {
-          state.requests.frontendCache += 1;
-          state.requests.saveFrontendCache += 1;
-          return makeCachedSettingsSaveResponse(state.settingsSaveCache, 'hit');
-        }
 
-        fastInit = await gzipFastSaveInit(fastInit);
-        var saveResponsePromise = rawFetch(route.fastPath, fastInit);
-        if (saveKey) {
-          var saveCachePromise = saveResponsePromise
-            .then(function (saveResponse) {
-              return cacheSettingsSaveResponse(saveResponse, saveKey);
+        var pendingEntry = null;
+        var saveResponsePromise;
+        if (typeof bodyText === 'string') {
+          pendingEntry = { bodyText: bodyText, promise: null };
+          state.settingsSavePending = pendingEntry;
+          saveResponsePromise = (async function () {
+            var preparedInit = await gzipFastSaveInit(fastInit);
+            return rawFetch(route.fastPath, preparedInit);
+          })();
+          pendingEntry.promise = saveResponsePromise
+            .then(function (res) {
+              if (!res || typeof res.clone !== 'function') return null;
+              return snapshotSettingsSaveResponse(res.clone());
             })
             .catch(function (error) {
               state.requests.errors += 1;
               state.lastSaveCacheError = error && error.message ? error.message : String(error);
               return null;
-            })
-            .finally(function () {
-              if (state.settingsSavePending && state.settingsSavePending.key === saveKey) {
-                state.settingsSavePending = null;
-              }
             });
-          state.settingsSavePending = { key: saveKey, promise: saveCachePromise };
+        } else {
+          fastInit = await gzipFastSaveInit(fastInit);
+          saveResponsePromise = rawFetch(route.fastPath, fastInit);
         }
 
-        var saveResponse = await saveResponsePromise;
+        var saveResponse;
+        try {
+          saveResponse = await saveResponsePromise;
+        } finally {
+          if (pendingEntry && state.settingsSavePending === pendingEntry) {
+            state.settingsSavePending = null;
+          }
+        }
         if (saveResponse && saveResponse.ok) {
           if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
             clearSettingsGetCache('save');
@@ -5014,6 +4698,8 @@ export function closeStEndpointCaches() {
     settingsBackupSchedulers.clear();
     lastBackupHashes.clear();
     cacheTmpSweepTimestamps.clear();
+    userCaches.clear();
+    updateLocks.clear();
     fastSearchUserCaches.clear();
     fastSearchLoadLocks.clear();
     chatBackupUserCaches.clear();
@@ -5176,22 +4862,6 @@ export function registerStEndpoints(router, manager) {
             error: true,
             message: 'Progressive chat loading is disabled',
         });
-
-        try {
-            const result = await getFastChatGet(req);
-
-            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', result.meta.elapsedMs || 0);
-            setSafeHeader(res, 'X-Baibaoku-Chat-Kind', result.kind);
-            setSafeHeader(res, 'X-Baibaoku-Chat-Partial', result.meta.partial === true);
-            setSafeHeader(res, 'X-Baibaoku-Chat-Total-Messages', result.meta.totalMessages || 0);
-            res.json({
-                ok: true,
-                data: result,
-            });
-        } catch (error) {
-            console.error('[baibaoku] Error in fast-get endpoint:', error);
-            res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
-        }
     });
 
     router.get('/v1/fast-config', async (req, res) => {

@@ -137,7 +137,8 @@ enableServerPluginsAutoUpdate: false
   - 任何情况下（包括 `force: true` 强制更新）都**不会**自动切回远端默认分支（如 `main`），避免误切回未裁剪的上游主线；提示信息仅展示相对扩展路径（`extensions/<folder>` 或 `public/scripts/extensions/third-party/<folder>`）。
 - **主题懒加载耦合、扩展 Manifest 缓存与设置缓存凭据边界**：
   - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果以目录 `mtimeMs` 校验配合 30 秒 TTL 兜底缓存（`FX2-1`，禁用列表每次实时从设置解析；世界书 Tokenizer 桥接宏门控同步覆盖旧式 `<CHARIFNOTGROUP>/<GROUP>`，`FX2-2`，详以 ST canonical 规范为准）；检测到未安装/刚卸载/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动立即回退下发完整主题列表，避免单独禁用或卸载柏宝箱后无法切换主题。
-  - `early-bridge` 仅拦截扩展根目录 `/scripts/extensions/third-party/<扩展>/manifest.json`；缓存未命中或扩展子目录内的 `manifest.json` 一律交还酒馆原生静态路由，不伪造 404（`0.7.4`）。
+  - `early-bridge` 仅拦截扩展根目录 `/scripts/extensions/third-party/<扩展>/manifest.json`；缓存未命中或扩展子目录内的 `manifest.json` 一律交还酒馆原生静态路由，不伪造 404（`0.7.4`）。同时完全移除对 `window.MutationObserver` 的键盘扫描包装（交由酒馆原生 `keyboard.js` 唯一负责，`chatKeyboardScanReductionEnabled` 固定返回 `false` 并在桥接态同步暴露 `initialFastConfig`），移除客户端基于 32 位哈希的跨请求 `/api/settings/save` 缓存跳过（仅保留并发同体请求合并，交由后端精确字节比对落盘）。
+  - **快速列表与酒馆原生契约严格对齐（`WP-3`）**：`/v1/characters/fast-all` 按每角色 `chats/<角色>` 子目录 `mtimeMs`（含目录删除重置归零）增量校验聊天统计而不再依赖 POSIX 下不会变动的顶层 `chats/` `mtimeMs`，严格对齐酒馆 `toShallow` 的 `fav` V2 布尔优先级、`data_size`、`default_` 前缀与损坏/无名卡剔除及缓存驱逐；`/v1/chats/fast-recent`、`/v1/chats/fast-search` 与 `/v1/chat-backups/fast-list` 对齐酒馆原生尾行损坏降级预览、备份 `send_date`/`mes`/`file_id` 字段及群聊已删文件缓存回收；已退役的 `/v1/chats/fast-get` 仅保留 `410 Gone` 响应。
   - `data/<user>/baibaoku/cache/` 中的设置快速载荷缓存会镜像 `extension_settings`（包括柏宝箱内置柏宝砚 / 共享渠道 `baibai_api_channels` 的副渠道明文 API Key），与同用户目录 `settings.json` 处于同一信任边界；副渠道建议使用低权限/限额 Key（配合 Vertex 主渠道跟随模式时保持 Vertex `API 版本` 为「自动」或 `v1beta1`，详见柏宝箱 Runbook），备份迁移或导出排障前按敏感凭据同等保护。
 
 ## 8. 大阶段收口时的部署交接

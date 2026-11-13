@@ -50,13 +50,18 @@ const { getThemeBridgeStatus, installThemeBridge, patchPowerUserJs } = await imp
 const { patchRegexEngineJs } = await import('../src/regex-bridge-installer.js');
 const { patchOpenAIJs, unpatchOpenAIJs } = await import('../src/openai-tokenizer-bridge-installer.js');
 const { patchWorldInfoJs, unpatchWorldInfoJs } = await import('../src/world-info-tokenizer-bridge-installer.js');
+const { sync: writeFileAtomicSync } = await import('write-file-atomic');
+const { write: writeCharacterPng } = await import('../../../src/character-card-parser.js');
+const { DatabaseManager } = await import('../src/database.js');
 const {
     SETTINGS_CACHE_INVALIDATE_PREFIXES,
     SETTINGS_CACHE_READONLY_PATHS,
     closeStEndpointCaches,
     countSingleMessageBulk,
+    formatShallowCharacter,
     hasActiveLazyThemeHydrator,
     makeEarlyBridgeScript,
+    registerStEndpoints,
     shouldInvalidateSettingsGetCachePath,
 } = await import('../src/st-endpoints.js');
 const {
@@ -1194,4 +1199,674 @@ test('FX3-2: system and builtin Git adapters verify complete (branch.<name>.remo
         }
     }
 });
+
+const ONE_PIXEL_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64',
+);
+
+function createUserContext(handle) {
+    const root = path.join(globalThis.DATA_ROOT, handle);
+    const directories = {
+        root,
+        characters: path.join(root, 'characters'),
+        chats: path.join(root, 'chats'),
+        groups: path.join(root, 'groups'),
+        groupChats: path.join(root, 'group chats'),
+        backups: path.join(root, 'backups'),
+        extensions: path.join(root, 'extensions'),
+    };
+    for (const dir of Object.values(directories)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    return {
+        profile: { handle, admin: true },
+        directories,
+    };
+}
+
+function createEndpointHarness(dbManager) {
+    const getHandlers = new Map();
+    const postHandlers = new Map();
+    const router = {
+        get(routePath, handler) { getHandlers.set(routePath, handler); },
+        post(routePath, handler) { postHandlers.set(routePath, handler); },
+    };
+    registerStEndpoints(router, dbManager);
+
+    async function invoke(method, routePath, { user, body = {}, headers = {} } = {}) {
+        const handler = method === 'GET' ? getHandlers.get(routePath) : postHandlers.get(routePath);
+        assert.equal(typeof handler, 'function', `expected ${method} ${routePath} to be registered`);
+        const normalizedHeaders = Object.fromEntries(
+            Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]),
+        );
+        const req = {
+            method,
+            path: routePath,
+            user,
+            body,
+            headers: normalizedHeaders,
+            get(name) { return normalizedHeaders[String(name).toLowerCase()]; },
+        };
+        let statusCode = 200;
+        let payload;
+        let ended = false;
+        const resHeaders = new Map();
+        const res = {
+            status(code) { statusCode = code; return res; },
+            set(name, val) { resHeaders.set(String(name).toLowerCase(), String(val)); return res; },
+            setHeader(name, val) { resHeaders.set(String(name).toLowerCase(), String(val)); return res; },
+            getHeader(name) { return resHeaders.get(String(name).toLowerCase()); },
+            type(ct) { resHeaders.set('content-type', String(ct)); return res; },
+            json(data) { payload = data; ended = true; return res; },
+            send(data) { payload = data; ended = true; return res; },
+        };
+        await handler(req, res);
+        assert.equal(ended, true, `${method} ${routePath} must send a response`);
+        return { status: statusCode, body: payload, headers: resHeaders };
+    }
+
+    return { invoke };
+}
+
+function writeV2CardPng(filePath, cardObject) {
+    const buf = writeCharacterPng(ONE_PIXEL_PNG, JSON.stringify(cardObject));
+    fs.writeFileSync(filePath, buf);
+}
+
+test('WP-3 Chain 1a: /v1/characters/fast-all detects POSIX chats/<charName> atomic updates without top-level chats/ mtime change and resets deleted chat folders to 0', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp3-posix-user');
+        const { characters: charactersDir, chats: chatsDir } = user.directories;
+
+        writeV2CardPng(path.join(charactersDir, 'Alice.png'), {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: { name: 'Alice', description: 'Wonderland', extensions: { fav: false } },
+        });
+        writeV2CardPng(path.join(charactersDir, 'Bob.png'), {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: { name: 'Bob', description: 'Builder', extensions: { fav: true } },
+        });
+
+        const aliceChatDir = path.join(chatsDir, 'Alice');
+        fs.mkdirSync(aliceChatDir, { recursive: true });
+        fs.utimesSync(aliceChatDir, 1_700_000_000, 1_700_000_000);
+        const frozenTopChatsTime = new Date(1_700_000_000 * 1000);
+        fs.utimesSync(chatsDir, frozenTopChatsTime, frozenTopChatsTime);
+
+        // Prime cache when Alice's chat directory exists and is empty
+        const initialRes = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        assert.equal(initialRes.status, 200);
+        const alice0 = initialRes.body.find(c => c.avatar === 'Alice.png');
+        assert.ok(alice0);
+        assert.equal(alice0.chat_size, 0);
+        assert.equal(alice0.date_last_chat, 0);
+
+        const topChatsStatBefore = fs.statSync(chatsDir);
+        const charsStatBefore = fs.statSync(charactersDir);
+
+        // Simulate ST's Linux writeFileAtomicSync inside chats/Alice/chat1.jsonl:
+        // updates chats/Alice/ mtimeMs while top-level chats/ and characters/ mtimeMs stay unchanged!
+        const chat1Path = path.join(aliceChatDir, '2026-05-01@12h00m00s.jsonl');
+        const chat1Payload = '{"chat_metadata":{}}\n{"name":"Alice","mes":"Hello POSIX!","send_date":"2026-05-01T12:00:00.000Z"}\n';
+        writeFileAtomicSync(chat1Path, chat1Payload, 'utf8');
+        fs.utimesSync(chatsDir, frozenTopChatsTime, frozenTopChatsTime);
+
+        assert.equal(fs.statSync(chatsDir).mtimeMs, topChatsStatBefore.mtimeMs, 'top-level chats/ mtimeMs must remain unchanged');
+        assert.equal(fs.statSync(charactersDir).mtimeMs, charsStatBefore.mtimeMs, 'characters/ mtimeMs must remain unchanged');
+
+        const afterChatWriteRes = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        const alice1 = afterChatWriteRes.body.find(c => c.avatar === 'Alice.png');
+        const chat1Stat = fs.statSync(chat1Path);
+        assert.equal(alice1.chat_size, chat1Stat.size, 'chat_size must update even when top-level chats/ mtimeMs did not change');
+        assert.equal(alice1.date_last_chat, chat1Stat.mtimeMs, 'date_last_chat must update even when top-level chats/ mtimeMs did not change');
+
+        // Also verify when charactersChanged === true (new Carol.png added) while Alice.png is unchanged and Alice gets chat2.jsonl
+        const chat2Path = path.join(aliceChatDir, '2026-05-01@12h05m00s.jsonl');
+        writeFileAtomicSync(chat2Path, '{"chat_metadata":{}}\n{"name":"Alice","mes":"Second chat"}\n', 'utf8');
+        fs.utimesSync(chatsDir, frozenTopChatsTime, frozenTopChatsTime);
+        writeV2CardPng(path.join(charactersDir, 'Carol.png'), {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: { name: 'Carol', description: 'Singer', extensions: { fav: false } },
+        });
+        const charsBumpedTime = new Date(Date.now() + 5_000);
+        fs.utimesSync(charactersDir, charsBumpedTime, charsBumpedTime);
+
+        const afterBothChangedRes = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        const alice2 = afterBothChangedRes.body.find(c => c.avatar === 'Alice.png');
+        const chat2Stat = fs.statSync(chat2Path);
+        assert.equal(alice2.chat_size, chat1Stat.size + chat2Stat.size, 'unchanged .png must still refresh chat stats when charactersChanged is true');
+        assert.equal(alice2.date_last_chat, Math.max(chat1Stat.mtimeMs, chat2Stat.mtimeMs));
+
+        // Deleting chats/Alice/ must reset date_last_chat and chat_size back to 0 (even if top-level chats/ mtime is restored)
+        fs.rmSync(aliceChatDir, { recursive: true, force: true });
+        fs.utimesSync(chatsDir, frozenTopChatsTime, frozenTopChatsTime);
+
+        const afterDeleteDirRes = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        const alice3 = afterDeleteDirRes.body.find(c => c.avatar === 'Alice.png');
+        assert.equal(alice3.chat_size, 0, 'deleted character chat folder must reset chat_size to 0');
+        assert.equal(alice3.date_last_chat, 0, 'deleted character chat folder must reset date_last_chat to 0');
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
+test('WP-3 Chain 1b: /v1/characters/fast-all and formatShallowCharacter match ST Core toShallow parity and evict corrupted/nameless cards from memory + SQLite', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp3-shallow-user');
+        const { characters: charactersDir, chats: chatsDir } = user.directories;
+
+        // 1. Direct unit checks on formatShallowCharacter for pure V1 (no spec) and V2 cards
+        const fakeStat = { ctimeMs: 1_710_000_123.456, mtimeMs: 1_710_000_500, size: 512 };
+        const v1Raw = JSON.stringify({
+            name: 'default_Seraphina',
+            description: 'A guardian angel.',
+            personality: 'Warm',
+            scenario: 'Sanctuary',
+            first_mes: 'Greetings!',
+            mes_example: '',
+            creatorcomment: 'Created for V1 test',
+            fav: 'false',
+            tags: 'angel, guardian',
+            creator: 'Tester',
+        });
+        const v1Shallow = await formatShallowCharacter('default_Seraphina.png', fakeStat, v1Raw, chatsDir, null);
+        assert.ok(v1Shallow);
+        assert.equal(v1Shallow.name, 'default_Seraphina', 'must preserve default_ prefix matching ST Core');
+        assert.equal(v1Shallow.data.name, 'default_Seraphina');
+        assert.equal(v1Shallow.fav, false, 'string "false" must normalize to boolean false, never truthy string');
+        assert.equal(v1Shallow.data.extensions.fav, false);
+        assert.deepEqual(v1Shallow.tags, ['angel', 'guardian']);
+        assert.equal(v1Shallow.date_added, fakeStat.ctimeMs);
+        assert.equal(v1Shallow.create_date, new Date(Math.round(fakeStat.ctimeMs)).toISOString());
+
+        const expectedV1DataSize = [
+            'default_Seraphina',
+            'A guardian angel.',
+            'Warm',
+            'Sanctuary',
+            'Greetings!',
+            '',
+            'Created for V1 test',
+            '',
+            '',
+            String(['angel', 'guardian']),
+            'Tester',
+            '',
+            String([]),
+            '[object Object]',
+        ].reduce((acc, s) => acc + s.length, 0);
+        assert.equal(v1Shallow.data_size, expectedV1DataSize, 'V1 data_size must match ST convertToV2 + calculateDataSize');
+
+        // 2. V2 fav boolean precedence (root fav: true overridden by data.extensions.fav: false; string "true" -> true)
+        const v2PrecedenceCard = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            name: 'WrongRootName',
+            fav: true,
+            extra_huge_root_blob: 'x'.repeat(5000),
+            data: {
+                name: 'default_Knight',
+                description: 'Loyal knight',
+                personality: 'Stoic',
+                scenario: 'Castle',
+                first_mes: 'Halt.',
+                mes_example: '',
+                creator_notes: 'V2 notes',
+                system_prompt: '',
+                post_history_instructions: '',
+                tags: ['knight'],
+                creator: 'Author',
+                character_version: '1.2',
+                alternate_greetings: ['Welcome.'],
+                extensions: {
+                    fav: false,
+                    world: 'KingdomLore',
+                },
+            },
+        };
+        writeV2CardPng(path.join(charactersDir, 'default_Knight.png'), v2PrecedenceCard);
+
+        const v2StringTrueCard = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            fav: false,
+            data: {
+                name: 'Mage',
+                description: 'Arcane scholar',
+                extensions: { fav: 'true' },
+            },
+        };
+        writeV2CardPng(path.join(charactersDir, 'Mage.png'), v2StringTrueCard);
+
+        // Corrupted (no PNG metadata) and nameless cards present on disk
+        fs.writeFileSync(path.join(charactersDir, 'Corrupted.png'), ONE_PIXEL_PNG);
+        writeV2CardPng(path.join(charactersDir, 'Nameless.png'), {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: { name: '   ', description: 'Should be omitted' },
+        });
+
+        const listRes1 = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        assert.equal(listRes1.status, 200);
+        const avatars1 = listRes1.body.map(c => c.avatar).sort();
+        assert.deepEqual(avatars1, ['Mage.png', 'default_Knight.png'], 'corrupted and nameless cards must be omitted');
+
+        const knight = listRes1.body.find(c => c.avatar === 'default_Knight.png');
+        assert.equal(knight.name, 'default_Knight');
+        assert.equal(knight.fav, false, 'V2 data.extensions.fav=false must override legacy root fav=true');
+        assert.equal(knight.data.extensions.fav, false);
+        const expectedKnightDataSize = Object.values(v2PrecedenceCard.data).reduce((acc, val) => acc + String(val).length, 0);
+        assert.equal(knight.data_size, expectedKnightDataSize, 'V2 data_size must match ST calculateDataSize(v2.data) without root bloat');
+
+        const mage = listRes1.body.find(c => c.avatar === 'Mage.png');
+        assert.equal(mage.fav, true, 'string "true" in data.extensions.fav must normalize to boolean true');
+        assert.equal(mage.data.extensions.fav, true);
+
+        // 3. Corrupting a previously cached valid card must evict it from BOTH memory and SQLite persistent cache
+        const magePath = path.join(charactersDir, 'Mage.png');
+        fs.writeFileSync(magePath, ONE_PIXEL_PNG);
+        const futureTime = new Date(Date.now() + 10_000);
+        fs.utimesSync(magePath, futureTime, futureTime);
+        fs.utimesSync(charactersDir, futureTime, futureTime);
+
+        const listRes2 = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        assert.deepEqual(listRes2.body.map(c => c.avatar), ['default_Knight.png'], 'newly corrupted card must be evicted immediately');
+
+        // Reload from SQLite after clearing in-memory caches + seeding a legacy schema=1 fabricated entry
+        const dummyReq = { user };
+        await dbManager.set(dummyReq, 'baibaoku.internal', 'character-fast-all', 'Corrupted.png', {
+            mtime: fs.statSync(path.join(charactersDir, 'Corrupted.png')).mtimeMs,
+            size: ONE_PIXEL_PNG.length,
+            data: { shallow: true, name: 'Corrupted', avatar: 'Corrupted.png' },
+        });
+        closeStEndpointCaches();
+
+        const listRes3 = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        assert.deepEqual(listRes3.body.map(c => c.avatar), ['default_Knight.png'], 'SQLite reload must not resurrect corrupted or schema=1 fabricated cards');
+        const dbMage = await dbManager.get(dummyReq, 'baibaoku.internal', 'character-fast-all', 'Mage.png');
+        assert.equal(dbMage.exists, false, 'Mage.png must be deleted from SQLite persistent store');
+        const dbCorrupted = await dbManager.get(dummyReq, 'baibaoku.internal', 'character-fast-all', 'Corrupted.png');
+        assert.equal(dbCorrupted.exists, false, 'legacy schema=1 fabricated entry must be purged from SQLite');
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
+test('WP-3 Chain 2a: /v1/chats/fast-recent and /v1/chats/fast-search emit degraded previews instead of hiding chats, recompute null cache rows, and GC deleted group chats', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp3-chats-user');
+        const { characters: charactersDir, chats: chatsDir, groups: groupsDir, groupChats: groupChatsDir } = user.directories;
+
+        writeV2CardPng(path.join(charactersDir, 'Hero.png'), {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: { name: 'Hero', extensions: { fav: false } },
+        });
+
+        const heroChatsDir = path.join(chatsDir, 'Hero');
+        fs.mkdirSync(heroChatsDir, { recursive: true });
+
+        const emptyFile = path.join(heroChatsDir, '01_empty.jsonl');
+        const validTrailingNl = path.join(heroChatsDir, '02_valid_nl.jsonl');
+        const blankTailFile = path.join(heroChatsDir, '03_blank_tail.jsonl');
+        const corruptTwoLines = path.join(heroChatsDir, '04_corrupt_2.jsonl');
+        const corruptThreeLines = path.join(heroChatsDir, '05_corrupt_3.jsonl');
+
+        fs.writeFileSync(emptyFile, '');
+        fs.writeFileSync(
+            validTrailingNl,
+            '{"chat_metadata":{"note":"meta"}}\n{"name":"Hero","mes":"Valid message","send_date":"2026-06-01T10:00:00.000Z"}\n',
+        );
+        fs.writeFileSync(
+            blankTailFile,
+            '{"chat_metadata":{}}\n{"name":"Hero","mes":"Before blank line","send_date":"2026-06-01T09:00:00.000Z"}\n\n',
+        );
+        fs.writeFileSync(corruptTwoLines, '{"chat_metadata":{}}\n{truncated_json');
+        fs.writeFileSync(
+            corruptThreeLines,
+            '{"chat_metadata":{}}\n{"name":"Hero","mes":"Intact first reply"}\n{"foo":"missing_known_fields"}\n',
+        );
+
+        // Pre-seed SQLite fast-search cache with a legacy `result: null` marker to verify it recomputes instead of hiding!
+        const corruptTwoStat = fs.statSync(corruptTwoLines);
+        await dbManager.openForRequest({ user }, 'baibaoku.internal', { displayName: '柏宝库内部缓存', version: 1 });
+        await dbManager.set({ user }, 'baibaoku.internal', 'chats-fast-search', corruptTwoLines, {
+            schema: 2,
+            mtime: corruptTwoStat.mtimeMs,
+            size: corruptTwoStat.size,
+            result: null,
+        });
+        closeStEndpointCaches();
+
+        const recentRes = await harness.invoke('POST', '/v1/chats/fast-recent', {
+            user,
+            body: { max: 20, metadata: true },
+        });
+        assert.equal(recentRes.status, 200);
+        const recentById = new Map(recentRes.body.map(item => [item.file_id, item]));
+        assert.equal(recentById.size, 5, 'fast-recent must never hide empty, blank-tail, or corrupted-tail chat files');
+
+        assert.equal(recentById.get('01_empty').chat_items, 0);
+        assert.equal(recentById.get('01_empty').mes, '[The chat is empty]');
+        assert.equal(recentById.get('01_empty').last_mes, new Date(Math.round(fs.statSync(emptyFile).mtimeMs)).toISOString());
+
+        assert.equal(recentById.get('02_valid_nl').chat_items, 1);
+        assert.equal(recentById.get('02_valid_nl').mes, 'Valid message');
+        assert.equal(recentById.get('02_valid_nl').last_mes, '2026-06-01T10:00:00.000Z');
+        assert.deepEqual(recentById.get('02_valid_nl').chat_metadata, { note: 'meta' });
+
+        assert.equal(recentById.get('03_blank_tail').chat_items, 1, 'blank trailing line must exclude header + blank tail');
+        assert.equal(recentById.get('03_blank_tail').mes, '[The message is empty]');
+        assert.equal(recentById.get('03_blank_tail').last_mes, new Date(Math.round(fs.statSync(blankTailFile).mtimeMs)).toISOString());
+
+        assert.equal(recentById.get('04_corrupt_2').chat_items, 0, '2-line header+corrupt must report 0 valid messages');
+        assert.equal(recentById.get('04_corrupt_2').mes, '[The message is empty]');
+
+        assert.equal(recentById.get('05_corrupt_3').chat_items, 1, '3-line header+msg+corrupt must report 1 valid message');
+        assert.equal(recentById.get('05_corrupt_3').mes, '[The message is empty]');
+
+        const searchRes = await harness.invoke('POST', '/v1/chats/fast-search', {
+            user,
+            body: { query: '', avatar_url: 'Hero.png' },
+        });
+        assert.equal(searchRes.status, 200);
+        const searchByName = new Map(searchRes.body.map(item => [item.file_name, item]));
+        assert.equal(searchByName.size, 5, 'fast-search must return all 5 chat files including recomputed null cache entry');
+        assert.equal(searchByName.get('01_empty').message_count, 0);
+        assert.equal(searchByName.get('01_empty').preview_message, '[The chat is empty]');
+        assert.equal(searchByName.get('02_valid_nl').message_count, 1);
+        assert.equal(searchByName.get('02_valid_nl').preview_message, 'Valid message');
+        assert.equal(searchByName.get('03_blank_tail').message_count, 1);
+        assert.equal(searchByName.get('03_blank_tail').preview_message, '[The message is empty]');
+        assert.equal(searchByName.get('04_corrupt_2').message_count, 0);
+        assert.equal(searchByName.get('04_corrupt_2').preview_message, '[The message is empty]');
+        assert.equal(searchByName.get('05_corrupt_3').message_count, 1);
+        assert.equal(searchByName.get('05_corrupt_3').preview_message, '[The message is empty]');
+
+        // Group chat GC test: deleting a group chat file removes its cache key without touching other groups' existing chats
+        const gc1Path = path.join(groupChatsDir, 'gc_g1_keep.jsonl');
+        const gc2Path = path.join(groupChatsDir, 'gc_g1_delete.jsonl');
+        const gcOtherPath = path.join(groupChatsDir, 'gc_g2_keep.jsonl');
+        fs.writeFileSync(gc1Path, '{"chat_metadata":{}}\n{"name":"Hero","mes":"G1 keep"}\n');
+        fs.writeFileSync(gc2Path, '{"chat_metadata":{}}\n{"name":"Hero","mes":"G1 delete"}\n');
+        fs.writeFileSync(gcOtherPath, '{"chat_metadata":{}}\n{"name":"Hero","mes":"G2 keep"}\n');
+        fs.writeFileSync(path.join(groupsDir, 'g1.json'), JSON.stringify({ id: 'group-1', chats: ['gc_g1_keep', 'gc_g1_delete'] }));
+        fs.writeFileSync(path.join(groupsDir, 'g2.json'), JSON.stringify({ id: 'group-2', chats: ['gc_g2_keep'] }));
+
+        await harness.invoke('POST', '/v1/chats/fast-search', { user, body: { query: '', group_id: 'group-1' } });
+        await harness.invoke('POST', '/v1/chats/fast-search', { user, body: { query: '', group_id: 'group-2' } });
+
+        fs.unlinkSync(gc2Path);
+        fs.writeFileSync(path.join(groupsDir, 'g1.json'), JSON.stringify({ id: 'group-1', chats: ['gc_g1_keep'] }));
+
+        const groupAfterGc = await harness.invoke('POST', '/v1/chats/fast-search', {
+            user,
+            body: { query: '', group_id: 'group-1' },
+        });
+        assert.equal(groupAfterGc.status, 200);
+        assert.deepEqual(groupAfterGc.body.map(x => x.file_name), ['gc_g1_keep']);
+        assert.equal(groupAfterGc.headers.get('x-baibaoku-search-cache-gc'), '1');
+
+        const deletedEntry = await dbManager.get({ user }, 'baibaoku.internal', 'chats-fast-search', gc2Path);
+        const keptGroup1Entry = await dbManager.get({ user }, 'baibaoku.internal', 'chats-fast-search', gc1Path);
+        const keptGroup2Entry = await dbManager.get({ user }, 'baibaoku.internal', 'chats-fast-search', gcOtherPath);
+        assert.equal(deletedEntry.exists, false, 'deleted group chat file must be pruned from SQLite fast-search cache');
+        assert.equal(keptGroup1Entry.exists, true);
+        assert.equal(keptGroup2Entry.exists, true, 'other groups existing chat files must never be pruned');
+
+        // Verify /v1/chats/fast-get remains 410 Gone and dead helper code is removed from st-endpoints.js
+        const fastGetRes = await harness.invoke('POST', '/v1/chats/fast-get', { user, body: {} });
+        assert.equal(fastGetRes.status, 410);
+        assert.equal(fastGetRes.body?.error, true);
+        const stEndpointsSource = fs.readFileSync(path.join(pluginRoot, 'src/st-endpoints.js'), 'utf8');
+        assert.equal(stEndpointsSource.includes('function getFastChatGet'), false);
+        assert.equal(stEndpointsSource.includes('scanJsonlTailRanges'), false);
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
+test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, and file_id with native /api/backups/chat/get parity and invalidates legacy schema=1 cache', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp3-backups-user');
+        const { backups: backupsDir } = user.directories;
+
+        const b1 = path.join(backupsDir, 'chat_Hero_20260101.jsonl');
+        const bEmpty = path.join(backupsDir, 'chat_Hero_empty.jsonl');
+        const bCorrupt = path.join(backupsDir, 'chat_Hero_corrupt.jsonl');
+
+        fs.writeFileSync(
+            b1,
+            '{"chat_metadata":{}}\n{"name":"Hero","mes":"Restored greeting","send_date":"2026-02-14T08:30:00.000Z"}\n',
+        );
+        const olderMtime = new Date('2025-01-01T00:00:00.000Z');
+        fs.utimesSync(b1, olderMtime, olderMtime);
+        fs.writeFileSync(bEmpty, '');
+        fs.writeFileSync(bCorrupt, '{"chat_metadata":{}}\n{"name":"Hero","mes":"Msg 1"}\n{broken_tail');
+
+        // Seed stale schema=1 row lacking send_date/mes
+        const b1Stat = fs.statSync(b1);
+        await dbManager.openForRequest({ user }, 'baibaoku.internal', { displayName: 'BaiBaoKu internal cache', version: 1 });
+        await dbManager.set({ user }, 'baibaoku.internal', 'chat-backups-fast-list', 'chat_Hero_20260101.jsonl', {
+            schema: 1,
+            mtime: b1Stat.mtimeMs,
+            size: b1Stat.size,
+            chatItems: 1,
+        });
+        closeStEndpointCaches();
+
+        const res1 = await harness.invoke('POST', '/v1/chat-backups/fast-list', { user });
+        assert.equal(res1.status, 200);
+        assert.equal(res1.headers.get('x-baibaoku-cache-misses'), '3', 'legacy schema=1 backup cache entry must recompute');
+
+        const byName = new Map(res1.body.map(item => [item.file_name, item]));
+        assert.equal(byName.size, 3);
+
+        const row1 = byName.get('chat_Hero_20260101.jsonl');
+        assert.equal(row1.file_id, 'chat_Hero_20260101');
+        assert.equal(row1.chat_items, 1);
+        assert.equal(row1.mes, 'Restored greeting');
+        assert.equal(row1.last_mes, '2026-02-14T08:30:00.000Z', 'last_mes must come from tail send_date rather than file mtimeMs');
+
+        const rowEmpty = byName.get('chat_Hero_empty.jsonl');
+        assert.equal(rowEmpty.file_id, 'chat_Hero_empty');
+        assert.equal(rowEmpty.chat_items, 0);
+        assert.equal(rowEmpty.mes, '[The chat is empty]');
+        assert.equal(rowEmpty.last_mes, new Date(Math.round(fs.statSync(bEmpty).mtimeMs)).toISOString());
+
+        const rowCorrupt = byName.get('chat_Hero_corrupt.jsonl');
+        assert.equal(rowCorrupt.file_id, 'chat_Hero_corrupt');
+        assert.equal(rowCorrupt.chat_items, 1);
+        assert.equal(rowCorrupt.mes, '[The message is empty]');
+        assert.equal(rowCorrupt.last_mes, new Date(Math.round(fs.statSync(bCorrupt).mtimeMs)).toISOString());
+
+        // Second call must hit schema=2 cache with identical fields
+        const res2 = await harness.invoke('POST', '/v1/chat-backups/fast-list', { user });
+        assert.equal(res2.headers.get('x-baibaoku-cache-hits'), '3');
+        assert.deepEqual(res2.body, res1.body);
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
+test('WP-3 Chain 3: makeEarlyBridgeScript preserves native MutationObserver, exposes initialFastConfig, eliminates settingsSaveCache hash drops, coalesces only in-flight identical saves, and invalidates on all mutating routes', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp3-bridge-user');
+
+        // 1. /v1/fast-config GET & POST must always report chatKeyboardScanReductionEnabled: false and progressiveChatLoadingEnabled: false
+        const getCfg = await harness.invoke('GET', '/v1/fast-config', { user });
+        assert.equal(getCfg.status, 200);
+        assert.equal(getCfg.body.data.chatKeyboardScanReductionEnabled, false);
+        assert.equal(getCfg.body.data.progressiveChatLoadingEnabled, false);
+
+        const setCfg = await harness.invoke('POST', '/v1/fast-config', {
+            user,
+            body: {
+                chatKeyboardScanReductionEnabled: true,
+                progressiveChatLoadingEnabled: true,
+                tokenizerBulkCountEnabled: false,
+            },
+        });
+        assert.equal(setCfg.status, 200);
+        assert.equal(setCfg.body.data.chatKeyboardScanReductionEnabled, false);
+        assert.equal(setCfg.body.data.progressiveChatLoadingEnabled, false);
+        assert.equal(setCfg.body.data.tokenizerBulkCountEnabled, false);
+
+        // 2. Verify makeEarlyBridgeScript never wraps MutationObserver, exposes initialFastConfig, and never drops sequential saves
+        const script = makeEarlyBridgeScript({
+            settingsAccelerationEnabled: true,
+            lazyThemeLoadingEnabled: false,
+            characterListAccelerationEnabled: true,
+            recentChatListAccelerationEnabled: false,
+            tokenizerBulkCountEnabled: false,
+            extensionManifestBundleEnabled: true,
+            versionAccelerationEnabled: true,
+            chatKeyboardScanReductionEnabled: true,
+        });
+        assert.equal(script.includes('installKeyboardObserverCoalescing'), false);
+        assert.equal(script.includes('hashStringForSaveKey'), false);
+
+        class NativeMutationObserver {
+            constructor(cb) { this.cb = cb; }
+            observe() {}
+            disconnect() {}
+            takeRecords() { return []; }
+        }
+
+        let fastSaveNetworkCalls = 0;
+        let saveGateRelease = null;
+        const windowObj = {
+            location: new URL('http://127.0.0.1:8000/'),
+            Response,
+            Headers,
+            Request,
+            Blob,
+            URL,
+            URLSearchParams,
+            TextEncoder,
+            TextDecoder,
+            Promise,
+            setTimeout,
+            clearTimeout,
+            MutationObserver: NativeMutationObserver,
+            document: {
+                readyState: 'complete',
+                body: {},
+                addEventListener: () => {},
+                documentElement: null,
+            },
+            fetch: async (input) => {
+                const url = typeof input === 'string' ? input : input.url;
+                const pathname = new URL(url, 'http://127.0.0.1:8000').pathname;
+                if (pathname === '/api/plugins/baibaoku/v1/settings/fast-save') {
+                    fastSaveNetworkCalls += 1;
+                    if (saveGateRelease) {
+                        await saveGateRelease;
+                    }
+                    return new Response(JSON.stringify({ ok: true }), {
+                        status: 200,
+                        headers: { 'content-type': 'application/json' },
+                    });
+                }
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                });
+            },
+        };
+        windowObj.window = windowObj;
+        windowObj.globalThis = windowObj;
+
+        vm.runInNewContext(script, windowObj);
+        const bridge = windowObj.__baibaokuEarlyBridge;
+        assert.equal(bridge.installed, true);
+        assert.equal(windowObj.MutationObserver, NativeMutationObserver, 'window.MutationObserver must remain 100% native');
+        assert.equal(Boolean(windowObj.MutationObserver.__baibaokuWrapped), false);
+        assert.equal(bridge.keyboardObserverCoalescingInstalled, false);
+        assert.equal(bridge.chatKeyboardScanReductionEnabled, false);
+        assert.equal(bridge.isChatKeyboardScanReductionEnabled(), false);
+        assert.equal(bridge.setChatKeyboardScanReductionEnabled(true), false);
+        assert.equal(bridge.chatKeyboardScanReductionEnabled, false);
+
+        assert.deepEqual({ ...bridge.initialFastConfig }, {
+            settingsAccelerationEnabled: true,
+            lazyThemeLoadingEnabled: false,
+            characterListAccelerationEnabled: true,
+            recentChatListAccelerationEnabled: false,
+            progressiveChatLoadingEnabled: false,
+            tokenizerBulkCountEnabled: false,
+            extensionManifestBundleEnabled: true,
+            versionAccelerationEnabled: true,
+            chatKeyboardScanReductionEnabled: false,
+        });
+
+        // 3. Sequential identical saves MUST both reach the backend (never dropped by client-side hash cache)
+        const payloadA = JSON.stringify({ active_preset: 'Alpha', temperature: 1.0 });
+        await windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadA });
+        assert.equal(fastSaveNetworkCalls, 1);
+        assert.equal(bridge.settingsSaveCache, null);
+
+        await windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadA });
+        assert.equal(fastSaveNetworkCalls, 2, 'sequential identical settings/save must never be dropped on the client');
+
+        // 4. Concurrent in-flight identical saves coalesce into 1 network request; different bodies do NOT coalesce
+        let releaseGate;
+        saveGateRelease = new Promise(resolve => { releaseGate = resolve; });
+        const payloadB = JSON.stringify({ active_preset: 'Beta', temperature: 0.8 });
+        const p1 = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadB });
+        const p2 = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadB });
+        await new Promise(resolve => setTimeout(resolve, 15));
+        assert.equal(fastSaveNetworkCalls, 3, 'concurrent identical in-flight saves must coalesce to 1 backend request');
+        releaseGate();
+        const [r1, r2] = await Promise.all([p1, p2]);
+        assert.equal(r1.ok, true);
+        assert.equal(r2.ok, true);
+        assert.deepEqual(await r1.json(), { ok: true });
+        assert.deepEqual(await r2.json(), { ok: true });
+        assert.equal(r2.headers.get('x-baibaoku-frontend-save-cache'), 'pending');
+        assert.equal(bridge.settingsSavePending, null);
+
+        // Concurrent DIFFERENT-body saves must NOT coalesce
+        saveGateRelease = new Promise(resolve => { releaseGate = resolve; });
+        const pd1 = windowObj.fetch('/api/settings/save', { method: 'POST', body: JSON.stringify({ k: 1 }) });
+        const pd2 = windowObj.fetch('/api/settings/save', { method: 'POST', body: JSON.stringify({ k: 2 }) });
+        await new Promise(resolve => setTimeout(resolve, 15));
+        assert.equal(fastSaveNetworkCalls, 5, 'concurrent different-body saves must both reach backend');
+        releaseGate();
+        await Promise.all([pd1, pd2]);
+
+        // 5. Non-save mutating route (e.g. /api/presets/save) clears settingsSavePending & calls clearSettingsSaveCache
+        bridge.settingsSavePending = { bodyText: payloadB, promise: Promise.resolve(null) };
+        await windowObj.fetch('/api/presets/save', { method: 'POST', body: '{"name":"Preset1"}' });
+        assert.equal(bridge.settingsSavePending, null, 'mutating routes must clear settingsSavePending');
+        assert.equal(bridge.lastSaveInvalidationReason, 'mutation:/api/presets/save');
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
 
