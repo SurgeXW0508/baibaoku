@@ -9,7 +9,8 @@
     "test:save-generate": "node --experimental-vm-modules --test scripts/test-save-generate-tools.mjs",
     "test:regex-bridge": "node --experimental-vm-modules --test scripts/test-regex-bridge.mjs",
     "test:extension-manager": "node --test scripts/test-extension-manager.mjs",
-    "test:self-update": "node --test scripts/test-self-update.mjs"
+    "test:self-update": "node --test scripts/test-self-update.mjs",
+    "test:perf-ownership": "node --test scripts/test-perf-ownership.mjs"
   },
   "engines": {
     "node": ">=20"
