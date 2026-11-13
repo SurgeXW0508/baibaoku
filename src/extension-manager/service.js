@@ -178,6 +178,24 @@ function isProtectedPersonalBranch(branch) {
     return typeof branch === 'string' && branch.startsWith('personal/');
 }
 
+function formatExtensionDisplayPath(target) {
+    return target.global
+        ? `public/scripts/extensions/third-party/${target.folder}`
+        : `extensions/${target.folder}`;
+}
+
+export function resolveTrackedBranch(info) {
+    if (info?.upstream !== null && info?.upstream !== undefined) {
+        return info.branch && isSafeBranchName(info.upstream)
+            ? { branch: info.upstream, inferred: false }
+            : null;
+    }
+    if (info?.branch && isSafeBranchName(info.branch) && !isProtectedPersonalBranch(info.branch)) {
+        return { branch: info.branch, inferred: true };
+    }
+    return null;
+}
+
 function downloadError(failures, action) {
     return new ExtensionOpError('DOWNLOAD_FAILED', `${action}失败:${describeFailures(failures) || '没有可用的线路'}`, {
         status: 502,
@@ -591,9 +609,10 @@ async function performUpdate({ env, job, op, target, force }) {
             hint: '安装系统 git 后重试。',
         });
     }
+    const displayPath = formatExtensionDisplayPath(target);
     const isPersonalBranch = isProtectedPersonalBranch(info.branch);
-    const trackedBranch = info.branch && info.upstream && isSafeBranchName(info.upstream) ? info.upstream : null;
-    if (!trackedBranch) {
+    const resolvedBranch = resolveTrackedBranch(info);
+    if (!resolvedBranch) {
         const branchLabel = info.branch
             ? `分支「${info.branch}」缺少上游跟踪配置`
             : '当前处于游离 HEAD 状态,缺少上游跟踪分支';
@@ -601,15 +620,16 @@ async function performUpdate({ env, job, op, target, force }) {
             status: 409,
             stage: 'inspect',
             hint: info.branch
-                ? `请手动检查并绑定上游跟踪分支(例如 git -C "${dir}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`
+                ? `请手动检查并绑定上游跟踪分支(例如 git -C "${displayPath}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`
                 : '请先手动检出目标分支并配置 origin 上游跟踪后再更新。',
         });
     }
+    const trackedBranch = resolvedBranch.branch;
     if (isPersonalBranch && trackedBranch !== info.branch) {
         throw new ExtensionOpError('BRANCH_PROTECTED', `受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」,已阻止自动更新。`, {
             status: 409,
             stage: 'inspect',
-            hint: `请手动将上游对齐到同名分支(git -C "${dir}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`,
+            hint: `请手动将上游对齐到同名分支(git -C "${displayPath}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`,
         });
     }
 
@@ -630,8 +650,8 @@ async function performUpdate({ env, job, op, target, force }) {
     if (!decision) {
         throw unreachableError(check, '检查更新', remote);
     }
-    op.setDetail('decision', { sha: decision.sha, authoritative: decision.authoritative, branchFound: decision.branchFound, defaultBranch: decision.defaultBranch });
-    if (!decision.authoritative && env.config.allowUnverifiedMirrorDecision !== true) {
+    op.setDetail('decision', { sha: decision.sha, authoritative: decision.authoritative, branchFound: decision.branchFound, defaultBranch: decision.defaultBranch, inferredUpstream: resolvedBranch.inferred });
+    if (!decision.authoritative && (resolvedBranch.inferred || env.config.allowUnverifiedMirrorDecision !== true)) {
         throw unverifiedMirrorError();
     }
 
@@ -642,6 +662,13 @@ async function performUpdate({ env, job, op, target, force }) {
     let switchNote = null;
     let targetSha = decision.sha;
     if (!decision.branchFound) {
+        if (resolvedBranch.inferred) {
+            throw new ExtensionOpError('NO_UPSTREAM', `「${folder}」分支「${info.branch}」缺少上游跟踪配置且远端不存在同名分支,已阻止自动切换到默认分支。`, {
+                status: 409,
+                stage: 'probe',
+                hint: `请手动检查并绑定上游跟踪分支(例如 git -C "${displayPath}" branch --set-upstream-to=origin/<目标分支> ${info.branch})后再更新。`,
+            });
+        }
         if (!decision.authoritative) {
             throw new ExtensionOpError('BRANCH_GONE', `镜像上找不到「${trackedBranch}」分支,GitHub 直连又不可用,无法确认分支是否还在。`, {
                 status: 502,
@@ -674,7 +701,16 @@ async function performUpdate({ env, job, op, target, force }) {
         switchNote = `远端已经没有「${trackedBranch}」分支,已切换到默认分支「${defaultBranch}」。`;
     }
 
-    const upToDate = extra => upToDateOutcome({ op, dir, info, warnings, route: decision.agreeing[0]?.route.label ?? null, ...extra });
+    const ensureUpstream = resolvedBranch.inferred ? localBranch : null;
+    const upToDate = async (extra) => {
+        if (ensureUpstream) {
+            const healWarnings = await adapter.finalize(dir, { fetchBranch, target: targetSha, switchedTo: null, ensureUpstream });
+            if (healWarnings.length) {
+                op.setDetail('finalizeWarnings', healWarnings);
+            }
+        }
+        return upToDateOutcome({ op, dir, info, warnings, route: decision.agreeing[0]?.route.label ?? null, ...extra });
+    };
     if (!switchTo && await isContained(adapter, dir, targetSha, info.head)) {
         return upToDate();
     }
@@ -784,7 +820,7 @@ async function performUpdate({ env, job, op, target, force }) {
     }
 
     stage(job, op, 'finalize', '收尾');
-    const finalizeWarnings = await adapter.finalize(dir, { fetchBranch, target: targetSha, switchedTo: switchTo });
+    const finalizeWarnings = await adapter.finalize(dir, { fetchBranch, target: targetSha, switchedTo: switchTo, ensureUpstream });
     if (finalizeWarnings.length) {
         op.setDetail('finalizeWarnings', finalizeWarnings);
     }
@@ -893,10 +929,11 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
     }
 
     const isPersonalBranch = isProtectedPersonalBranch(info.branch);
-    const trackedBranch = info.branch && info.upstream && isSafeBranchName(info.upstream) ? info.upstream : null;
-    if (!trackedBranch) {
+    const resolvedBranch = resolveTrackedBranch(info);
+    if (!resolvedBranch) {
         return failed(info.branch ? `分支「${info.branch}」缺少上游跟踪配置` : '当前处于游离 HEAD 状态,缺少上游跟踪分支', { code: 'NO_UPSTREAM', detached: !info.branch });
     }
+    const trackedBranch = resolvedBranch.branch;
     if (isPersonalBranch && trackedBranch !== info.branch) {
         return failed(`受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」`, { code: 'BRANCH_PROTECTED' });
     }
@@ -929,7 +966,7 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
         op.finish({ ok: false, code: error.code, message: error.message, hint: error.hint });
         return failed(error.message, { hint: error.hint, opId: op.id });
     }
-    if (!decision.authoritative && env.config.allowUnverifiedMirrorDecision !== true) {
+    if (!decision.authoritative && (resolvedBranch.inferred || env.config.allowUnverifiedMirrorDecision !== true)) {
         return failed('仅镜像可达，无法确认版本。', { code: 'UNVERIFIED_MIRROR', authoritative: false });
     }
 
@@ -939,6 +976,8 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
     if (decision.branchFound) {
         remoteCommit = decision.sha;
         isUpToDate = await isContained(adapter, target.dir, remoteCommit, info.head);
+    } else if (resolvedBranch.inferred) {
+        return failed(`分支「${info.branch}」缺少上游跟踪配置且远端不存在同名分支`, { code: 'NO_UPSTREAM', detached: false, branchGone: true });
     } else if (!decision.authoritative) {
         // 只有镜像说分支不存在,不可信
         return failed(`镜像上找不到「${trackedBranch}」分支`);

@@ -15,29 +15,49 @@ const BRIDGE_BLOCK_PATTERN = new RegExp(
 const ANCHOR = "    console.log('theme applied: ' + name);\n}";
 const ANCHOR_CRLF = "    console.log('theme applied: ' + name);\r\n}";
 
-export function installThemeBridge() {
-    const powerUserPath = getPowerUserPath();
+const themeBridgeStatusByPath = new Map();
 
+export function installThemeBridge({ powerUserPath = getPowerUserPath() } = {}) {
     try {
         const originalSource = fs.readFileSync(powerUserPath, 'utf8');
         const patchedSource = patchPowerUserJs(originalSource);
 
         if (patchedSource === originalSource) {
-            if (hasThemeBridge(originalSource)) {
+            const installed = hasThemeBridge(originalSource);
+            themeBridgeStatusByPath.set(powerUserPath, installed);
+            if (installed) {
                 console.log('[baibaoku] Theme bridge is already installed in public/scripts/power-user.js.');
             } else {
                 console.warn('[baibaoku] Theme bridge was not installed: public/scripts/power-user.js did not match known anchors.');
             }
-            return { changed: false, path: powerUserPath };
+            return { changed: false, installed, path: powerUserPath };
         }
 
         writeFileAtomicSync(powerUserPath, patchedSource, 'utf8');
+        themeBridgeStatusByPath.set(powerUserPath, true);
         console.log('[baibaoku] Installed theme bridge into public/scripts/power-user.js.');
 
-        return { changed: true, path: powerUserPath };
+        return { changed: true, installed: true, path: powerUserPath };
     } catch (error) {
+        themeBridgeStatusByPath.set(powerUserPath, false);
         console.warn('[baibaoku] Failed to install theme bridge into public/scripts/power-user.js:', error.message);
-        return { changed: false, path: powerUserPath, error };
+        return { changed: false, installed: false, path: powerUserPath, error };
+    }
+}
+
+export function getThemeBridgeStatus({ powerUserPath = getPowerUserPath(), forceRefresh = false } = {}) {
+    if (!forceRefresh && themeBridgeStatusByPath.has(powerUserPath)) {
+        return themeBridgeStatusByPath.get(powerUserPath);
+    }
+
+    try {
+        const source = fs.readFileSync(powerUserPath, 'utf8');
+        const installed = hasThemeBridge(source);
+        themeBridgeStatusByPath.set(powerUserPath, installed);
+        return installed;
+    } catch {
+        themeBridgeStatusByPath.set(powerUserPath, false);
+        return false;
     }
 }
 

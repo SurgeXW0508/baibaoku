@@ -20,6 +20,7 @@ import {
     closeSaveGenerateJobs,
     registerSaveGenerateEndpoints,
 } from './save-generate.js';
+import { getThemeBridgeStatus } from './theme-bridge-installer.js';
 import { setSafeHeader } from './header-utils.js';
 
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
@@ -1692,19 +1693,82 @@ function shouldUseLazyThemeSettingsPayload(req) {
     return String(req.get('x-baibaoku-lazy-themes') || '') === '1';
 }
 
-const DEFAULT_POWER_USER_JS_PATH = path.join(
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..'),
-    'public',
-    'scripts',
-    'power-user.js',
-);
+const LAZY_THEME_TOOLKIT_SCAN_TTL_MS = 30_000;
+const lazyThemeToolkitDirCache = new Map();
+
+function scanExtensionBaseForToolkitFolders(baseDir, now) {
+    const cached = lazyThemeToolkitDirCache.get(baseDir);
+    if (cached && now < cached.expiresAt) {
+        return cached.entries;
+    }
+
+    if (!fs.existsSync(baseDir)) {
+        const emptyEntries = [];
+        lazyThemeToolkitDirCache.set(baseDir, {
+            entries: emptyEntries,
+            expiresAt: now + LAZY_THEME_TOOLKIT_SCAN_TTL_MS,
+        });
+        return emptyEntries;
+    }
+
+    const dirents = fs.readdirSync(baseDir, { withFileTypes: true });
+    const entries = [];
+    for (const dirent of dirents) {
+        const folder = dirent.name;
+        if (!folder || folder.startsWith('.baibaoku-')) {
+            continue;
+        }
+        const folderPath = path.join(baseDir, folder);
+        let isDir = dirent.isDirectory();
+        if (!isDir && dirent.isSymbolicLink()) {
+            try {
+                isDir = fs.statSync(folderPath).isDirectory();
+            } catch {
+                isDir = false;
+            }
+        }
+        if (!isDir || !hasExtensionManifest(baseDir, folder)) {
+            continue;
+        }
+
+        let isToolkit = folder === 'ST-BaiBai-Tools' || folder === 'SillyTavern-Mobile-Resize-Guard';
+        if (!isToolkit) {
+            try {
+                const manifest = JSON.parse(fs.readFileSync(path.join(folderPath, 'manifest.json'), 'utf8'));
+                isToolkit = manifest?.display_name === '柏宝箱';
+            } catch (error) {
+                if (error instanceof SyntaxError || error?.code === 'ENOENT') {
+                    isToolkit = false;
+                } else {
+                    throw error;
+                }
+            }
+        }
+        entries.push({ folder, isToolkit });
+    }
+
+    lazyThemeToolkitDirCache.set(baseDir, {
+        entries,
+        expiresAt: now + LAZY_THEME_TOOLKIT_SCAN_TTL_MS,
+    });
+    return entries;
+}
 
 export function hasActiveLazyThemeHydrator(req, settingsText, {
     globalExtensionsDir = PUBLIC_DIRECTORIES.globalExtensions,
-    powerUserPath = DEFAULT_POWER_USER_JS_PATH,
+    powerUserPath,
+    themeBridgeInstalled,
     extensionsEnabled = true,
+    now = Date.now(),
 } = {}) {
     if (extensionsEnabled === false) {
+        return false;
+    }
+
+    const bridgeInstalled = typeof themeBridgeInstalled === 'boolean'
+        ? themeBridgeInstalled
+        : (powerUserPath ? getThemeBridgeStatus({ powerUserPath }) : getThemeBridgeStatus());
+    if (!bridgeInstalled) {
         return false;
     }
 
@@ -1718,28 +1782,11 @@ export function hasActiveLazyThemeHydrator(req, settingsText, {
         const userExtensionsDir = req?.user?.directories?.extensions;
         const candidateBases = [userExtensionsDir, globalExtensionsDir].filter(Boolean);
         const seenFolders = new Set();
-        let hasActiveToolkit = false;
 
         for (const baseDir of candidateBases) {
-            if (!fs.existsSync(baseDir)) {
-                continue;
-            }
-            const dirents = fs.readdirSync(baseDir, { withFileTypes: true });
-            for (const dirent of dirents) {
-                const folder = dirent.name;
-                if (!folder || folder.startsWith('.baibaoku-') || seenFolders.has(folder)) {
-                    continue;
-                }
-                const folderPath = path.join(baseDir, folder);
-                let isDir = dirent.isDirectory();
-                if (!isDir && dirent.isSymbolicLink()) {
-                    try {
-                        isDir = fs.statSync(folderPath).isDirectory();
-                    } catch {
-                        isDir = false;
-                    }
-                }
-                if (!isDir || !hasExtensionManifest(baseDir, folder)) {
+            const entries = scanExtensionBaseForToolkitFolders(baseDir, now);
+            for (const { folder, isToolkit } of entries) {
+                if (seenFolders.has(folder)) {
                     continue;
                 }
                 seenFolders.add(folder);
@@ -1748,38 +1795,13 @@ export function hasActiveLazyThemeHydrator(req, settingsText, {
                 if (disabledSet.has(extId) || disabledSet.has(folder)) {
                     continue;
                 }
-
-                let isToolkit = folder === 'ST-BaiBai-Tools' || folder === 'SillyTavern-Mobile-Resize-Guard';
-                if (!isToolkit) {
-                    try {
-                        const manifest = JSON.parse(fs.readFileSync(path.join(folderPath, 'manifest.json'), 'utf8'));
-                        isToolkit = manifest?.display_name === '柏宝箱';
-                    } catch {
-                        isToolkit = false;
-                    }
-                }
                 if (isToolkit) {
-                    hasActiveToolkit = true;
-                    break;
+                    return true;
                 }
             }
-            if (hasActiveToolkit) {
-                break;
-            }
         }
 
-        if (!hasActiveToolkit) {
-            return false;
-        }
-
-        if (powerUserPath && fs.existsSync(powerUserPath)) {
-            const powerUserSource = fs.readFileSync(powerUserPath, 'utf8');
-            if (!powerUserSource.includes('// baibaoku theme bridge:start')) {
-                return false;
-            }
-        }
-
-        return true;
+        return false;
     } catch {
         return false;
     }
@@ -3474,10 +3496,20 @@ function warmFastVersionCache() {
     });
 }
 
-const READONLY_WORLDINFO_PATHS = new Set([
+export const SETTINGS_CACHE_READONLY_PATHS = Object.freeze([
     '/api/worldinfo/get',
     '/api/worldinfo/list',
 ]);
+
+export const SETTINGS_CACHE_INVALIDATE_PREFIXES = Object.freeze([
+    '/api/worldinfo/',
+    '/api/presets/',
+    '/api/themes/',
+    '/api/quick-replies/',
+    '/api/moving-ui/',
+]);
+
+const READONLY_WORLDINFO_PATHS = new Set(SETTINGS_CACHE_READONLY_PATHS);
 
 export function shouldInvalidateSettingsGetCachePath(pathname, method) {
     if (method !== 'POST' || typeof pathname !== 'string') {
@@ -3489,13 +3521,7 @@ export function shouldInvalidateSettingsGetCachePath(pathname, method) {
     if (READONLY_WORLDINFO_PATHS.has(pathname)) {
         return false;
     }
-    return [
-        '/api/worldinfo/',
-        '/api/presets/',
-        '/api/themes/',
-        '/api/quick-replies/',
-        '/api/moving-ui/',
-    ].some(prefix => pathname.startsWith(prefix));
+    return SETTINGS_CACHE_INVALIDATE_PREFIXES.some(prefix => pathname.startsWith(prefix));
 }
 
 export function makeEarlyBridgeScript(options = {}) {
@@ -3538,6 +3564,8 @@ export function makeEarlyBridgeScript(options = {}) {
   var EXTENSION_MANIFEST_BUNDLE_ENABLED = ${JSON.stringify(extensionManifestBundleEnabled)};
   var VERSION_ACCELERATION_ENABLED = ${JSON.stringify(versionAccelerationEnabled)};
   var CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = ${JSON.stringify(chatKeyboardScanReductionEnabled)};
+  var SETTINGS_CACHE_READONLY_PATHS = ${JSON.stringify(SETTINGS_CACHE_READONLY_PATHS)};
+  var SETTINGS_CACHE_INVALIDATE_PREFIXES = ${JSON.stringify(SETTINGS_CACHE_INVALIDATE_PREFIXES)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -4027,14 +4055,8 @@ export function makeEarlyBridgeScript(options = {}) {
   function shouldInvalidateSettingsGetCache(url, method) {
     if (!url || url.origin !== location.origin || method !== 'POST') return false;
     if (url.pathname === '/api/settings/save') return true;
-    if (url.pathname === '/api/worldinfo/get' || url.pathname === '/api/worldinfo/list') return false;
-    return [
-      '/api/worldinfo/',
-      '/api/presets/',
-      '/api/themes/',
-      '/api/quick-replies/',
-      '/api/moving-ui/',
-    ].some(function (prefix) {
+    if (SETTINGS_CACHE_READONLY_PATHS.indexOf(url.pathname) !== -1) return false;
+    return SETTINGS_CACHE_INVALIDATE_PREFIXES.some(function (prefix) {
       return url.pathname.startsWith(prefix);
     });
   }
@@ -4051,6 +4073,7 @@ export function makeEarlyBridgeScript(options = {}) {
     state.lastInvalidatedAt = Date.now();
   }
 
+  state.shouldInvalidateSettingsGetCache = shouldInvalidateSettingsGetCache;
   state.clearSettingsGetCache = clearSettingsGetCache;
 
   function clearSettingsSaveCache(reason) {
@@ -4965,6 +4988,7 @@ export function closeStEndpointCaches() {
     settingsFileCaches.clear();
     settingsSaveLocks.clear();
     settingsResponseCaches.clear();
+    lazyThemeToolkitDirCache.clear();
     for (const scheduler of settingsBackupSchedulers.values()) {
         if (scheduler.timer) {
             clearTimeout(scheduler.timer);

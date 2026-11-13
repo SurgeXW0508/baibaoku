@@ -199,7 +199,7 @@ export const systemRepo = {
         return { ok: false, code: 'FAILED', files: [], detail };
     },
 
-    async finalize(dir, { fetchBranch, target, switchedTo }) {
+    async finalize(dir, { fetchBranch, target, switchedTo, ensureUpstream }) {
         const warnings = [];
         const run = async (args, label) => {
             const result = await local(dir, args);
@@ -209,16 +209,17 @@ export const systemRepo = {
         await run(['update-ref', `refs/remotes/origin/${fetchBranch}`, target], '更新远端跟踪分支');
         // 版本已经在本地、没走下载时临时引用不存在,删不掉也无所谓
         await local(dir, ['update-ref', '-d', tempRefName(fetchBranch)]);
-        if (switchedTo) {
-            await run(['config', `branch.${switchedTo}.remote`, 'origin'], '设置上游');
-            await run(['config', `branch.${switchedTo}.merge`, `refs/heads/${switchedTo}`], '设置上游');
+        const upstreamBranch = switchedTo || ensureUpstream;
+        if (upstreamBranch) {
+            await run(['config', `branch.${upstreamBranch}.remote`, 'origin'], '设置上游');
+            await run(['config', `branch.${upstreamBranch}.merge`, `refs/heads/${upstreamBranch}`], '设置上游');
             const specs = (await local(dir, ['config', '--get-all', 'remote.origin.fetch'])).stdout.split(/\r?\n/).filter(Boolean);
             const covered = specs.some(spec => {
                 const source = spec.replace(/^\+/, '').split(':')[0];
-                return source === 'refs/heads/*' || source === `refs/heads/${switchedTo}`;
+                return source === 'refs/heads/*' || source === `refs/heads/${upstreamBranch}`;
             });
             if (!covered) {
-                await run(['config', '--add', 'remote.origin.fetch', `+refs/heads/${switchedTo}:refs/remotes/origin/${switchedTo}`], '添加 fetch 规则');
+                await run(['config', '--add', 'remote.origin.fetch', `+refs/heads/${upstreamBranch}:refs/remotes/origin/${upstreamBranch}`], '添加 fetch 规则');
             }
         }
         return warnings;

@@ -235,7 +235,7 @@ export const builtinRepo = {
         }
     },
 
-    async finalize(dir, { fetchBranch, target, switchedTo }) {
+    async finalize(dir, { fetchBranch, target, switchedTo, ensureUpstream }) {
         const warnings = [];
         const attempt = async (label, task) => {
             try {
@@ -246,19 +246,20 @@ export const builtinRepo = {
         };
         await attempt('更新远端跟踪分支', () => git.writeRef({ fs, dir, ref: `refs/remotes/origin/${fetchBranch}`, value: target, force: true }));
         await git.deleteRef({ fs, dir, ref: tempRefName(fetchBranch) }).catch(() => {});
-        if (switchedTo) {
+        const upstreamBranch = switchedTo || ensureUpstream;
+        if (upstreamBranch) {
             await attempt('设置上游', async () => {
-                await git.setConfig({ fs, dir, path: `branch.${switchedTo}.remote`, value: 'origin' });
-                await git.setConfig({ fs, dir, path: `branch.${switchedTo}.merge`, value: `refs/heads/${switchedTo}` });
+                await git.setConfig({ fs, dir, path: `branch.${upstreamBranch}.remote`, value: 'origin' });
+                await git.setConfig({ fs, dir, path: `branch.${upstreamBranch}.merge`, value: `refs/heads/${upstreamBranch}` });
             });
             await attempt('添加 fetch 规则', async () => {
                 const specs = await git.getConfigAll({ fs, dir, path: 'remote.origin.fetch' });
                 const covered = specs.some(spec => {
                     const source = String(spec).replace(/^\+/, '').split(':')[0];
-                    return source === 'refs/heads/*' || source === `refs/heads/${switchedTo}`;
+                    return source === 'refs/heads/*' || source === `refs/heads/${upstreamBranch}`;
                 });
                 if (!covered) {
-                    await git.setConfig({ fs, dir, path: 'remote.origin.fetch', value: `+refs/heads/${switchedTo}:refs/remotes/origin/${switchedTo}`, append: true });
+                    await git.setConfig({ fs, dir, path: 'remote.origin.fetch', value: `+refs/heads/${upstreamBranch}:refs/remotes/origin/${upstreamBranch}`, append: true });
                 }
             });
         }
