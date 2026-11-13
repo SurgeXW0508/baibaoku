@@ -80,11 +80,13 @@ export const systemRepo = {
             localText(dir, ['rev-parse', '--is-shallow-repository']),
             localText(dir, ['config', '--get', 'remote.origin.url']),
         ]);
-        let upstream = branch || null;
+        let upstream = null;
         if (branch) {
             const merge = await localText(dir, ['config', '--get', `branch.${branch}.merge`]);
             if (merge.startsWith('refs/heads/')) {
                 upstream = merge.slice('refs/heads/'.length);
+            } else if (merge.startsWith('refs/remotes/origin/')) {
+                upstream = merge.slice('refs/remotes/origin/'.length);
             }
         }
         const tracking = upstream ? await localText(dir, ['rev-parse', '--verify', '-q', `refs/remotes/origin/${upstream}^{commit}`]) : '';

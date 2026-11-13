@@ -46,7 +46,18 @@ const DEFAULT_TEST_URL = 'https://github.com/SillyTavern/SillyTavern';
 const FILE_LOCK_RETRIES = 3;
 const MIN_STEP_MS = 5000;
 const NETWORK_HINT = '检查服务器的网络后稍后重试;服务器上开着代理软件时,柏宝库一般会自动用上。';
-const CONFIG_KEYS = ['interceptEnabled', 'proxy', 'autoDetectProxy', 'localProxyPorts', 'prefixMirrors', 'domainMirrors', 'probeTimeoutMs', 'operationTimeoutMs'];
+const CONFIG_KEYS = [
+    'interceptEnabled',
+    'proxy',
+    'autoDetectProxy',
+    'localProxyPorts',
+    'allowUnverifiedMirrorDecision',
+    'cloudMirrorsEnabled',
+    'prefixMirrors',
+    'domainMirrors',
+    'probeTimeoutMs',
+    'operationTimeoutMs',
+];
 
 let isomorphicGitVersion;
 
@@ -153,6 +164,18 @@ function unreachableError(check, action, remote) {
         stage: 'probe',
         hint: NETWORK_HINT,
     });
+}
+
+function unverifiedMirrorError() {
+    return new ExtensionOpError('UNVERIFIED_MIRROR', '仅镜像可达，无法确认版本。', {
+        status: 502,
+        stage: 'probe',
+        hint: '请确认直连或代理(如 mihomo)可用后重试;如确需信任镜像结果,可在扩展管理配置中显式开启 allowUnverifiedMirrorDecision。',
+    });
+}
+
+function isProtectedPersonalBranch(branch) {
+    return typeof branch === 'string' && branch.startsWith('personal/');
 }
 
 function downloadError(failures, action) {
@@ -298,6 +321,9 @@ async function performInstall({ req, env, job, op, target, remote }) {
     if (!decision) {
         throw unreachableError(check, '安装', remote);
     }
+    if (!decision.authoritative && env.config.allowUnverifiedMirrorDecision !== true) {
+        throw unverifiedMirrorError();
+    }
     if (branch && !decision.branchFound && decision.authoritative) {
         throw new ExtensionOpError('BRANCH_NOT_FOUND', `仓库里没有「${branch}」这个分支。`, { status: 400, stage: 'probe' });
     }
@@ -378,6 +404,8 @@ async function moveResidualAside(dir, folder, { op, warnings, user }) {
 
 async function cloneWithRoutes({ env, job, op, check, stagingDir, branch }) {
     const failures = [];
+    const mismatched = [];
+    const expectedSha = check.decision?.authoritative ? check.decision.sha : null;
     for (const route of orderFetchRoutes(check)) {
         throwIfAborted(job);
         job.update({ message: `正在下载(${route.label})`, progress: null });
@@ -390,15 +418,28 @@ async function cloneWithRoutes({ env, job, op, check, stagingDir, branch }) {
             timeoutMs: remainingMs(job),
             gitProxyKeys: env.proxyInfo.gitProxyKeys,
         });
-        op.addAttempt({ label: route.label, kind: route.kind, phase: 'clone', ok: result.ok, latencyMs: result.durationMs, error: result.ok ? null : result.failure });
+        const clonedSha = result.ok ? await env.adapter.readHead(stagingDir) : null;
+        op.addAttempt({ label: route.label, kind: route.kind, phase: 'clone', ok: result.ok, latencyMs: result.durationMs, error: result.ok ? null : result.failure, sha: clonedSha });
         if (result.ok) {
-            return route;
+            if (!expectedSha || route.authoritative || clonedSha === expectedSha) {
+                return route;
+            }
+            mismatched.push(route.label);
+            await removePath(stagingDir).catch(() => {});
+            continue;
         }
         failures.push({ route, failure: result.failure });
         // 探测通过但下载失败的线路,接下来一段时间排到后面
         recordRouteResult(check.cacheHost, { route, ok: false, latencyMs: result.durationMs, failure: result.failure });
     }
     throwIfAborted(job);
+    if (mismatched.length) {
+        throw new ExtensionOpError('REMOTE_CHANGED', `镜像下载的版本与权威源不一致(${formatList(mismatched)}),请稍后重试。`, {
+            status: 409,
+            stage: 'download',
+            hint: NETWORK_HINT,
+        });
+    }
     throw downloadError(failures, '下载扩展');
 }
 
@@ -550,7 +591,27 @@ async function performUpdate({ env, job, op, target, force }) {
             hint: '安装系统 git 后重试。',
         });
     }
+    const isPersonalBranch = isProtectedPersonalBranch(info.branch);
     const trackedBranch = info.branch && info.upstream && isSafeBranchName(info.upstream) ? info.upstream : null;
+    if (!trackedBranch) {
+        const branchLabel = info.branch
+            ? `分支「${info.branch}」缺少上游跟踪配置`
+            : '当前处于游离 HEAD 状态,缺少上游跟踪分支';
+        throw new ExtensionOpError('NO_UPSTREAM', `「${folder}」${branchLabel},已阻止自动切换到远端默认分支。`, {
+            status: 409,
+            stage: 'inspect',
+            hint: info.branch
+                ? `请手动检查并绑定上游跟踪分支(例如 git -C "${dir}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`
+                : '请先手动检出目标分支并配置 origin 上游跟踪后再更新。',
+        });
+    }
+    if (isPersonalBranch && trackedBranch !== info.branch) {
+        throw new ExtensionOpError('BRANCH_PROTECTED', `受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」,已阻止自动更新。`, {
+            status: 409,
+            stage: 'inspect',
+            hint: `请手动将上游对齐到同名分支(git -C "${dir}" branch --set-upstream-to=origin/${info.branch} ${info.branch})后再更新。`,
+        });
+    }
 
     stage(job, op, 'probe', '正在检查远端版本');
     const check = await checkRemote({
@@ -570,6 +631,9 @@ async function performUpdate({ env, job, op, target, force }) {
         throw unreachableError(check, '检查更新', remote);
     }
     op.setDetail('decision', { sha: decision.sha, authoritative: decision.authoritative, branchFound: decision.branchFound, defaultBranch: decision.defaultBranch });
+    if (!decision.authoritative && env.config.allowUnverifiedMirrorDecision !== true) {
+        throw unverifiedMirrorError();
+    }
 
     // 要对齐到哪个分支的哪个版本
     let fetchBranch = trackedBranch;
@@ -577,38 +641,37 @@ async function performUpdate({ env, job, op, target, force }) {
     let switchTo = null;
     let switchNote = null;
     let targetSha = decision.sha;
-    if (!trackedBranch || !decision.branchFound) {
-        const defaultBranch = decision.defaultBranch;
-        if (trackedBranch && !decision.authoritative) {
+    if (!decision.branchFound) {
+        if (!decision.authoritative) {
             throw new ExtensionOpError('BRANCH_GONE', `镜像上找不到「${trackedBranch}」分支,GitHub 直连又不可用,无法确认分支是否还在。`, {
                 status: 502,
                 stage: 'probe',
                 hint: NETWORK_HINT,
             });
         }
+        if (isPersonalBranch || isProtectedPersonalBranch(trackedBranch)) {
+            throw new ExtensionOpError('BRANCH_PROTECTED', `远端找不到受保护分支「${info.branch || trackedBranch}」,已阻止自动切换到默认分支「${decision.defaultBranch || 'main'}」。`, {
+                status: 409,
+                stage: 'probe',
+                hint: '请手动检查远端 origin 是否指向个人 Fork 仓库且存在对应 personal 分支后再更新。',
+            });
+        }
+        const defaultBranch = decision.defaultBranch;
         if (!defaultBranch || !isSafeBranchName(defaultBranch) || !decision.defaultSha) {
             throw new ExtensionOpError('BRANCH_UNKNOWN', '无法确定远端的默认分支。', { status: 502, stage: 'probe' });
         }
         if (!pristine && !force) {
-            throw trackedBranch
-                ? new ExtensionOpError('BRANCH_GONE', `远端已经没有「${trackedBranch}」分支了。`, {
-                    status: 409,
-                    stage: 'probe',
-                    hint: `你在这个扩展里有自己的提交,所以没有自动切换。可以用强制更新切到默认分支「${defaultBranch}」(会先备份)。`,
-                })
-                : new ExtensionOpError('DETACHED_HEAD', '当前不在任何分支上,而且有自己的提交。', {
-                    status: 409,
-                    stage: 'probe',
-                    hint: `可以用强制更新切到默认分支「${defaultBranch}」(会先备份)。`,
-                });
+            throw new ExtensionOpError('BRANCH_GONE', `远端已经没有「${trackedBranch}」分支了。`, {
+                status: 409,
+                stage: 'probe',
+                hint: `你在这个扩展里有自己的提交,所以没有自动切换。可以用强制更新切到默认分支「${defaultBranch}」(会先备份)。`,
+            });
         }
         fetchBranch = defaultBranch;
         localBranch = defaultBranch;
         switchTo = defaultBranch;
         targetSha = decision.defaultSha;
-        switchNote = trackedBranch
-            ? `远端已经没有「${trackedBranch}」分支,已切换到默认分支「${defaultBranch}」。`
-            : `原来不在任何分支上,已切换到默认分支「${defaultBranch}」。`;
+        switchNote = `远端已经没有「${trackedBranch}」分支,已切换到默认分支「${defaultBranch}」。`;
     }
 
     const upToDate = extra => upToDateOutcome({ op, dir, info, warnings, route: decision.agreeing[0]?.route.label ?? null, ...extra });
@@ -829,7 +892,14 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
         return failed('内置 git 只支持 http/https 地址');
     }
 
+    const isPersonalBranch = isProtectedPersonalBranch(info.branch);
     const trackedBranch = info.branch && info.upstream && isSafeBranchName(info.upstream) ? info.upstream : null;
+    if (!trackedBranch) {
+        return failed(info.branch ? `分支「${info.branch}」缺少上游跟踪配置` : '当前处于游离 HEAD 状态,缺少上游跟踪分支', { code: 'NO_UPSTREAM', detached: !info.branch });
+    }
+    if (isPersonalBranch && trackedBranch !== info.branch) {
+        return failed(`受保护分支「${info.branch}」跟踪了不一致的远端分支「${trackedBranch}」`, { code: 'BRANCH_PROTECTED' });
+    }
     const op = new OpRecorder({ kind: 'version', user: getUserHandle(req), extension: target.folder, global: target.global, backend: env.backend, gitVersion: env.gitVersion, source: remote.display });
     let check;
     try {
@@ -859,19 +929,24 @@ export async function checkExtensionVersion(req, body, { includeRemoteManifest =
         op.finish({ ok: false, code: error.code, message: error.message, hint: error.hint });
         return failed(error.message, { hint: error.hint, opId: op.id });
     }
+    if (!decision.authoritative && env.config.allowUnverifiedMirrorDecision !== true) {
+        return failed('仅镜像可达，无法确认版本。', { code: 'UNVERIFIED_MIRROR', authoritative: false });
+    }
 
     let remoteCommit;
     let isUpToDate;
     let branchGone = false;
-    if (trackedBranch && decision.branchFound) {
+    if (decision.branchFound) {
         remoteCommit = decision.sha;
         isUpToDate = await isContained(adapter, target.dir, remoteCommit, info.head);
-    } else if (trackedBranch && !decision.authoritative) {
+    } else if (!decision.authoritative) {
         // 只有镜像说分支不存在,不可信
         return failed(`镜像上找不到「${trackedBranch}」分支`);
+    } else if (isPersonalBranch || isProtectedPersonalBranch(trackedBranch)) {
+        return failed(`远端找不到受保护分支「${info.branch || trackedBranch}」`, { code: 'BRANCH_PROTECTED', branchGone: true });
     } else {
-        // 游离 HEAD 或远端删了分支:纯净安装在更新时会自动切到默认分支,只有这种情况提示有更新
-        branchGone = Boolean(trackedBranch);
+        // 远端删了非保护分支:纯净安装在更新时会自动切到默认分支,只有这种情况提示有更新
+        branchGone = true;
         remoteCommit = decision.defaultSha;
         const pristine = !(await hasLocalCommitsInReflog(gitDir));
         isUpToDate = !(pristine && remoteCommit && !(await isContained(adapter, target.dir, remoteCommit, info.head)));

@@ -94,6 +94,8 @@ export function normalizeConfig(input, { strict = false } = {}) {
         proxy,
         autoDetectProxy: source.autoDetectProxy !== false,
         localProxyPorts: normalizePorts(source.localProxyPorts, strict ? fail : null),
+        allowUnverifiedMirrorDecision: source.allowUnverifiedMirrorDecision === true,
+        cloudMirrorsEnabled: source.cloudMirrorsEnabled === true,
         prefixMirrors: normalizeList(source.prefixMirrors, DEFAULT_PREFIX_MIRRORS, normalizePrefixMirror, '镜像地址', strict ? fail : null),
         domainMirrors: normalizeList(source.domainMirrors, DEFAULT_DOMAIN_MIRRORS, normalizeDomainMirror, '镜像域名', strict ? fail : null),
         probeTimeoutMs: clampInteger(source.probeTimeoutMs, 2000, 30000, 8000),

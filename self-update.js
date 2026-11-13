@@ -71,10 +71,16 @@ async function selfUpdate({ root, autoUpdate = readStAutoUpdate(), dataRoot = gl
         return { status: 'no-remote' };
     }
 
+    const allowUnverifiedMirror = readAllowUnverifiedMirror(dataRoot);
+    const probeRoutes = allowUnverifiedMirror ? routes : routes.filter(route => route.kind !== 'mirror');
+    if (probeRoutes.length === 0) {
+        return { status: 'no-remote' };
+    }
+
     const head = (await git(root, ['rev-parse', 'HEAD'])).stdout.trim();
-    const latest = await probeLatest(root, routes, remoteBranch, probeTimeoutMs);
+    const latest = await probeLatest(root, probeRoutes, remoteBranch, probeTimeoutMs);
     if (!latest) {
-        console.info('[BaiBaoKu] 检查更新失败(线路都连不上),先用当前版本启动。');
+        console.info('[BaiBaoKu] 检查更新失败(权威线路连不上),先用当前版本启动。');
         return { status: 'unreachable' };
     }
     if (latest.sha === head || await gitOk(root, ['merge-base', '--is-ancestor', latest.sha, head])) {
@@ -401,6 +407,18 @@ function readRouteStats(dataRoot) {
         return JSON.parse(fs.readFileSync(file, 'utf8'))?.hosts ?? {};
     } catch {
         return {};
+    }
+}
+
+function readAllowUnverifiedMirror(dataRoot) {
+    if (!dataRoot) {
+        return false;
+    }
+    try {
+        const file = path.join(path.resolve(dataRoot), '_baibaoku', 'extension-manager', 'config.json');
+        return JSON.parse(fs.readFileSync(file, 'utf8'))?.allowUnverifiedMirrorDecision === true;
+    } catch {
+        return false;
     }
 }
 

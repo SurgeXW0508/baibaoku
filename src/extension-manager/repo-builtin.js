@@ -70,13 +70,15 @@ export const builtinRepo = {
             branch = null;
         }
         let remoteUrl = '';
-        let upstream = branch;
+        let upstream = null;
         try {
             remoteUrl = String((await git.getConfig({ fs, dir, path: 'remote.origin.url' })) ?? '');
             if (branch) {
                 const merge = await git.getConfig({ fs, dir, path: `branch.${branch}.merge` });
                 if (typeof merge === 'string' && merge.startsWith('refs/heads/')) {
                     upstream = merge.slice('refs/heads/'.length);
+                } else if (typeof merge === 'string' && merge.startsWith('refs/remotes/origin/')) {
+                    upstream = merge.slice('refs/remotes/origin/'.length);
                 }
             }
         } catch {
@@ -302,6 +304,11 @@ export const builtinRepo = {
                 noTags: true,
                 onProgress: toProgress(onProgress),
             });
+            const clonedBranch = branch || (await git.currentBranch({ fs, dir: dest, fullname: false }).catch(() => null));
+            if (clonedBranch) {
+                await git.setConfig({ fs, dir: dest, path: `branch.${clonedBranch}.remote`, value: 'origin' }).catch(() => {});
+                await git.setConfig({ fs, dir: dest, path: `branch.${clonedBranch}.merge`, value: `refs/heads/${clonedBranch}` }).catch(() => {});
+            }
             return { ok: true, durationMs: Date.now() - started };
         } catch (error) {
             return {

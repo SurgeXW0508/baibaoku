@@ -187,12 +187,22 @@ export function probeRoutes(routes, options) {
     return new Promise(resolve => {
         const results = [];
         const controllers = new Set();
+        const requireAuthoritative = config?.allowUnverifiedMirrorDecision !== true;
         let pending = 0;
+        let activeAuthoritative = 0;
         let next = 0;
         let firstSuccessAt = 0;
         let finished = false;
         let escalateTimer = null;
         let graceTimer = null;
+
+        const hasPendingOrUnlaunchedAuthoritative = () => {
+            if (activeAuthoritative > 0) return true;
+            for (let i = next; i < routes.length; i++) {
+                if (routes[i].authoritative) return true;
+            }
+            return false;
+        };
 
         const finish = () => {
             if (finished) return;
@@ -208,6 +218,7 @@ export function probeRoutes(routes, options) {
             const controller = new AbortController();
             controllers.add(controller);
             pending++;
+            if (route.authoritative) activeAuthoritative++;
             void probeRoute(route, {
                 backend,
                 branch,
@@ -217,6 +228,7 @@ export function probeRoutes(routes, options) {
             }).then(result => {
                 controllers.delete(controller);
                 pending--;
+                if (route.authoritative) activeAuthoritative--;
                 if (finished) return;
                 results.push(result);
                 recordRouteResult(cacheHost, result);
@@ -243,14 +255,16 @@ export function probeRoutes(routes, options) {
                     finish();
                     return;
                 }
-                if (!firstSuccessAt) {
-                    firstSuccessAt = Date.now();
-                    const grace = purpose === 'version' ? 0 : GRACE_MS;
-                    if (grace === 0) {
-                        finish();
-                        return;
+                if (!requireAuthoritative || !hasPendingOrUnlaunchedAuthoritative()) {
+                    if (!firstSuccessAt) {
+                        firstSuccessAt = Date.now();
+                        const grace = (requireAuthoritative || purpose === 'version') ? 0 : GRACE_MS;
+                        if (grace === 0) {
+                            finish();
+                            return;
+                        }
+                        graceTimer = setTimeout(finish, grace);
                     }
-                    graceTimer = setTimeout(finish, grace);
                 }
             }
             if (pending === 0) {
@@ -332,13 +346,15 @@ export async function checkRemote({ remote, branch = null, purpose, backend, con
     }
     const cacheHost = remote.cacheHost || remote.host || 'other';
     const probeOptions = { backend, branch, config, gitProxyKeys: proxyInfo?.gitProxyKeys ?? [], signal, purpose, cacheHost, onResult };
+    const requireAuthoritative = config?.allowUnverifiedMirrorDecision !== true;
 
-    if (!exhaustive && !getFreshBest(cacheHost, routes) && discoveries.has(cacheHost)) {
+    const ranked = exhaustive ? routes : rankRoutes(routes, cacheHost);
+    const bestPool = requireAuthoritative ? ranked.filter(route => route.authoritative) : ranked;
+    if (!exhaustive && !getFreshBest(cacheHost, bestPool) && discoveries.has(cacheHost)) {
         await waitForDiscovery(discoveries.get(cacheHost), signal);
     }
 
-    const ranked = exhaustive ? routes : rankRoutes(routes, cacheHost);
-    const best = exhaustive ? null : getFreshBest(cacheHost, ranked);
+    const best = exhaustive ? null : getFreshBest(cacheHost, bestPool);
     const results = [];
 
     if (purpose === 'version' && best) {
@@ -359,12 +375,22 @@ export async function checkRemote({ remote, branch = null, purpose, backend, con
         }
     }
 
-    const remaining = ranked.filter(route => !results.some(result => result.route.id === route.id));
+    const rawRemaining = ranked.filter(route => !results.some(result => result.route.id === route.id));
+    const remaining = !exhaustive && requireAuthoritative
+        ? [
+            ...rawRemaining.filter(route => route.authoritative),
+            ...rawRemaining.filter(route => !route.authoritative),
+        ]
+        : rawRemaining;
+    const authoritativeCount = remaining.filter(route => route.authoritative).length;
     // 有上次的最快线路时先少发几条(权威线路只发它自己);版本检查走到这里说明最快线路刚失败,按正常批量发
     const fastPathFailed = results.length > 0;
-    const initialBatch = exhaustive
+    const baseInitialBatch = exhaustive
         ? remaining.length
         : best && !fastPathFailed ? (best.authoritative ? 1 : 3) : INITIAL_BATCH;
+    const initialBatch = !exhaustive && requireAuthoritative
+        ? Math.max(baseInitialBatch, authoritativeCount)
+        : baseInitialBatch;
     const probing = probeRoutes(remaining, { ...probeOptions, exhaustive, initialBatch });
     if (!best && !exhaustive && !discoveries.has(cacheHost)) {
         discoveries.set(cacheHost, probing);
@@ -374,8 +400,8 @@ export async function checkRemote({ remote, branch = null, purpose, backend, con
     }
     results.push(...await probing);
     const check = { routes: ranked, results, decision: decideRemote(results, { branch, localHead }), cacheHost, cloud: null };
-    // 内置线路全部连不上时再读云端镜像列表试一轮;手动测试线路时总是一起测,方便确认云端列表能用
-    if ((includeCloud || !results.some(result => result.ok)) && !signal?.aborted) {
+    // 云端镜像列表默认关闭,仅显式开启或手动测试线路时拉取
+    if ((includeCloud || (config?.cloudMirrorsEnabled === true && !results.some(result => result.ok))) && !signal?.aborted) {
         await addCloudMirrorRoutes(check, remote, { ...probeOptions, exhaustive, localHead, force: includeCloud });
     }
     return check;
