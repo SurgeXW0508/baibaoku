@@ -308,6 +308,28 @@ test('WP-K-1: all 5 bridge installers match ST release and candidate, patch idem
     ].join('\n');
     assert.equal(unpatchWorldInfoJs(legacySnippet), expectedUnpatchedSnippet);
 
+    // FX2-2: Verify migration from prior <USER|CHAR|BOT> bridge block leaves a single updated block and unpatches byte-exact
+    for (const [label, original] of [
+        ['release', git(stRepoRoot, 'show', 'release:public/scripts/world-info.js')],
+        ['candidate', fs.readFileSync(path.join(stRepoRoot, 'public/scripts/world-info.js'), 'utf8')],
+    ]) {
+        const cleanOriginal = unpatchWorldInfoJs(original);
+        const freshPatched = patchWorldInfoJs(cleanOriginal);
+        const priorBlockPatched = freshPatched.replace(
+            '/<(?:USER|BOT|CHAR|CHARIFNOTGROUP|GROUP)>/i',
+            '/<(?:USER|CHAR|BOT)>/i',
+        );
+        assert.notEqual(priorBlockPatched, freshPatched);
+        const migrated = patchWorldInfoJs(priorBlockPatched);
+        assert.equal(migrated, freshPatched, `migrating prior bridge block (${label}) must match fresh patch`);
+        assert.equal(
+            migrated.match(/\/\/ baibaoku world info tokenizer bridge:start/g)?.length,
+            1,
+            `migrating prior bridge block (${label}) must leave a single bridge block`,
+        );
+        assert.equal(unpatchWorldInfoJs(migrated), cleanOriginal, `unpatch after migration (${label}) must be byte-exact`);
+    }
+
     // Simulate stateful macro evaluation across bridge + ST native loop: macro runs exactly once
     let macroEvalCount = 0;
     const substituteParams = text => text.replace(/\{\{roll\}\}/g, () => String(++macroEvalCount));
@@ -324,6 +346,8 @@ test('WP-K-1: all 5 bridge installers match ST release and candidate, patch idem
         newEntries: [
             { content: 'Roll value: {{roll}}', ignoreBudget: false, useProbability: false, probability: 100 },
             { content: 'Plain lore text without macros', ignoreBudget: false, useProbability: true, probability: 50 },
+            { content: 'Group lore for <GROUP> members', ignoreBudget: false, useProbability: false, probability: 100 },
+            { content: 'Fallback <charifnotgroup> tag', ignoreBudget: false, useProbability: false, probability: 100 },
         ],
         timedEffects: { isEffectActive: () => false },
         Promise,
@@ -336,6 +360,8 @@ test('WP-K-1: all 5 bridge installers match ST release and candidate, patch idem
     assert.equal(bridgePayload.entries[0].maySkip, false);
     assert.equal(bridgePayload.entries[1].hasMacros, false);
     assert.equal(bridgePayload.entries[1].maySkip, true);
+    assert.equal(bridgePayload.entries[2].hasMacros, true, '<GROUP> legacy macro must set hasMacros=true');
+    assert.equal(bridgePayload.entries[3].hasMacros, true, '<CHARIFNOTGROUP> legacy macro must set hasMacros=true');
 
     // ST native loop then evaluates the kept entry's macro once
     const finalText = substituteParams(sandbox.newEntries[0].content);
