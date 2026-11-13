@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import bytes from 'bytes';
 import sanitize from 'sanitize-filename';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
@@ -1689,6 +1690,99 @@ function getSettingsPath(req) {
 
 function shouldUseLazyThemeSettingsPayload(req) {
     return String(req.get('x-baibaoku-lazy-themes') || '') === '1';
+}
+
+const DEFAULT_POWER_USER_JS_PATH = path.join(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..'),
+    'public',
+    'scripts',
+    'power-user.js',
+);
+
+export function hasActiveLazyThemeHydrator(req, settingsText, {
+    globalExtensionsDir = PUBLIC_DIRECTORIES.globalExtensions,
+    powerUserPath = DEFAULT_POWER_USER_JS_PATH,
+    extensionsEnabled = true,
+} = {}) {
+    if (extensionsEnabled === false) {
+        return false;
+    }
+
+    try {
+        const parsedSettings = settingsText ? JSON.parse(settingsText) : {};
+        const disabledList = Array.isArray(parsedSettings?.extension_settings?.disabledExtensions)
+            ? parsedSettings.extension_settings.disabledExtensions
+            : [];
+        const disabledSet = new Set(disabledList.map(item => String(item || '').trim()));
+
+        const userExtensionsDir = req?.user?.directories?.extensions;
+        const candidateBases = [userExtensionsDir, globalExtensionsDir].filter(Boolean);
+        const seenFolders = new Set();
+        let hasActiveToolkit = false;
+
+        for (const baseDir of candidateBases) {
+            if (!fs.existsSync(baseDir)) {
+                continue;
+            }
+            const dirents = fs.readdirSync(baseDir, { withFileTypes: true });
+            for (const dirent of dirents) {
+                const folder = dirent.name;
+                if (!folder || folder.startsWith('.baibaoku-') || seenFolders.has(folder)) {
+                    continue;
+                }
+                const folderPath = path.join(baseDir, folder);
+                let isDir = dirent.isDirectory();
+                if (!isDir && dirent.isSymbolicLink()) {
+                    try {
+                        isDir = fs.statSync(folderPath).isDirectory();
+                    } catch {
+                        isDir = false;
+                    }
+                }
+                if (!isDir || !hasExtensionManifest(baseDir, folder)) {
+                    continue;
+                }
+                seenFolders.add(folder);
+
+                const extId = `third-party/${folder}`;
+                if (disabledSet.has(extId) || disabledSet.has(folder)) {
+                    continue;
+                }
+
+                let isToolkit = folder === 'ST-BaiBai-Tools' || folder === 'SillyTavern-Mobile-Resize-Guard';
+                if (!isToolkit) {
+                    try {
+                        const manifest = JSON.parse(fs.readFileSync(path.join(folderPath, 'manifest.json'), 'utf8'));
+                        isToolkit = manifest?.display_name === '柏宝箱';
+                    } catch {
+                        isToolkit = false;
+                    }
+                }
+                if (isToolkit) {
+                    hasActiveToolkit = true;
+                    break;
+                }
+            }
+            if (hasActiveToolkit) {
+                break;
+            }
+        }
+
+        if (!hasActiveToolkit) {
+            return false;
+        }
+
+        if (powerUserPath && fs.existsSync(powerUserPath)) {
+            const powerUserSource = fs.readFileSync(powerUserPath, 'utf8');
+            if (!powerUserSource.includes('// baibaoku theme bridge:start')) {
+                return false;
+            }
+        }
+
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function getCurrentThemeNameFromSettingsText(text) {
@@ -4917,9 +5011,22 @@ export function registerStEndpoints(router, manager) {
     router.get('/v1/early/bridge.js', async (req, res) => {
         try {
             const config = await getSettingsFastConfigSafe(req, manager);
+            let effectiveConfig = config;
+            if (config.lazyThemeLoadingEnabled !== false && req.user?.directories?.root) {
+                const staticPayload = await getStaticSettingsPayload().catch(() => null);
+                const settingsInfo = req.user?.profile?.handle
+                    ? await readSettingsTextWithCache(req, req.user.profile.handle).catch(() => null)
+                    : null;
+                const hydratorActive = hasActiveLazyThemeHydrator(req, settingsInfo?.text || '', {
+                    extensionsEnabled: staticPayload ? staticPayload.enable_extensions : true,
+                });
+                if (!hydratorActive) {
+                    effectiveConfig = { ...config, lazyThemeLoadingEnabled: false };
+                }
+            }
             res.type('application/javascript; charset=utf-8');
             res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-            res.send(makeEarlyBridgeScript(config));
+            res.send(makeEarlyBridgeScript(effectiveConfig));
         } catch (error) {
             console.error('[baibaoku] Error in early bridge endpoint:', error);
             res.status(500).type('application/javascript; charset=utf-8').send(`console.error(${JSON.stringify(error.message)});`);
@@ -5189,7 +5296,11 @@ export function registerStEndpoints(router, manager) {
             }
 
             await waitForPendingSettingsSave(userHandle);
-            const lazyThemes = shouldUseLazyThemeSettingsPayload(req);
+            const requestedLazyThemes = shouldUseLazyThemeSettingsPayload(req);
+            const staticStartedAt = Date.now();
+            const staticPayload = await getStaticSettingsPayload();
+            metrics.staticMs = Date.now() - staticStartedAt;
+
             const settingsStartedAt = Date.now();
             const settingsPromise = readSettingsTextWithCache(req, userHandle)
                 .then((settingsInfo) => {
@@ -5202,13 +5313,18 @@ export function registerStEndpoints(router, manager) {
             let settingsInfo;
             let cachedPayload;
 
-            if (lazyThemes) {
+            if (requestedLazyThemes) {
                 settingsInfo = await settingsPromise;
+                const useLazyThemes = hasActiveLazyThemeHydrator(req, settingsInfo.text, {
+                    extensionsEnabled: staticPayload.enable_extensions,
+                });
                 payloadStartedAt = Date.now();
-                const payloadOptions = {
-                    themeMode: SETTINGS_THEME_MODE_LAZY,
-                    currentThemeName: getCurrentThemeNameFromSettingsText(settingsInfo.text),
-                };
+                const payloadOptions = useLazyThemes
+                    ? {
+                        themeMode: SETTINGS_THEME_MODE_LAZY,
+                        currentThemeName: getCurrentThemeNameFromSettingsText(settingsInfo.text),
+                    }
+                    : { themeMode: SETTINGS_THEME_MODE_FULL };
                 const lockKey = getSettingsUpdateLockKey(userHandle, payloadOptions);
                 if (!settingsUpdateLocks.has(lockKey)) {
                     const updatePromise = getFastSettingsPayload(req, userHandle, metrics, payloadOptions)
@@ -5238,10 +5354,6 @@ export function registerStEndpoints(router, manager) {
             }
             metrics.payloadMs = Date.now() - payloadStartedAt;
             ensureSettingsPayloadPersisted(req, userHandle);
-
-            const staticStartedAt = Date.now();
-            const staticPayload = await getStaticSettingsPayload();
-            metrics.staticMs = Date.now() - staticStartedAt;
 
             const responseStartedAt = Date.now();
             const response = await getFastSettingsResponse(
