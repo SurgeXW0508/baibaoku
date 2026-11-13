@@ -727,11 +727,13 @@ test('WP-K-3: security defaults, mirror-only rejection, Option A same-name branc
     assert.equal(fs.readFileSync(path.join(extDDir, 'index.js'), 'utf8'), 'export default "legit";\n');
 });
 
-test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids sync power-user reads, and respects live disabledExtensions', () => {
+test('WP-K-4 & FX2-1: hasActiveLazyThemeHydrator validates scan cache by directory mtime + 30s TTL, avoids sync power-user reads, and respects live disabledExtensions', () => {
     const extRoot = path.join(tmpRoot, 'theme-hydrator-exts');
     const globalRoot = path.join(tmpRoot, 'theme-hydrator-global');
     fs.mkdirSync(extRoot, { recursive: true });
     fs.mkdirSync(globalRoot, { recursive: true });
+    fs.utimesSync(extRoot, 1_700_000_000, 1_700_000_000);
+    fs.utimesSync(globalRoot, 1_700_000_000, 1_700_000_000);
 
     const powerUserWithBridge = path.join(tmpRoot, 'power-user-patched.js');
     const powerUserAnchorMismatch = path.join(tmpRoot, 'power-user-anchor-mismatch.js');
@@ -761,15 +763,15 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
         false,
     );
 
-    // Add ST-BaiBai-Tools and another extension on disk
+    // 2. FX2-1: Installing ST-BaiBai-Tools advances extRoot mtime -> invalidates cache immediately within 30s TTL
     const toolsDir = path.join(extRoot, 'ST-BaiBai-Tools');
     const otherExtDir = path.join(extRoot, 'other-ext');
     fs.mkdirSync(toolsDir, { recursive: true });
     fs.mkdirSync(otherExtDir, { recursive: true });
     fs.writeFileSync(path.join(toolsDir, 'manifest.json'), JSON.stringify({ display_name: '柏宝箱', js: 'dist/index.js' }));
     fs.writeFileSync(path.join(otherExtDir, 'manifest.json'), JSON.stringify({ display_name: 'Other', js: 'index.js' }));
+    fs.utimesSync(extRoot, 1_700_000_005, 1_700_000_005);
 
-    // Within 30s TTL (t0 + 10s), cached empty scan still holds; after TTL expires (t0 + 31s), rescans and returns true
     assert.equal(
         hasActiveLazyThemeHydrator(req, '{}', {
             globalExtensionsDir: globalRoot,
@@ -777,7 +779,8 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
             extensionsEnabled: true,
             now: t0 + 10_000,
         }),
-        false,
+        true,
+        'directory mtime change on install must invalidate scan cache immediately within 30s TTL',
     );
 
     let readdirCalls = 0;
@@ -794,20 +797,22 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
     };
 
     try {
-        // 2. TTL expired at t0 + 31s -> rescans directories once, returns true
-        const t1 = t0 + 31_000;
+        // 3. Repeated calls within 30s when mtime is unchanged trigger ZERO readdirSync and ZERO readFileSync
         assert.equal(
             hasActiveLazyThemeHydrator(req, '{}', {
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserWithBridge,
                 extensionsEnabled: true,
-                now: t1,
+                now: t0 + 15_000,
             }),
             true,
         );
-        assert.ok(readdirCalls > 0, 'expired TTL should trigger directory rescan');
+        assert.equal(readdirCalls, 0, 'unchanged mtime within 30s must not call readdirSync');
+        assert.equal(readFileCalls, 0, 'unchanged mtime within 30s must not call readFileSync');
 
-        // 3. Repeated calls within 30s (t1 + 5s) trigger ZERO readdirSync and ZERO readFileSync
+        // 4. FX2-1: Uninstalling ST-BaiBai-Tools advances extRoot mtime -> returns false immediately within 30s TTL
+        fs.rmSync(toolsDir, { recursive: true, force: true });
+        fs.utimesSync(extRoot, 1_700_000_016, 1_700_000_016);
         readdirCalls = 0;
         readFileCalls = 0;
         assert.equal(
@@ -815,15 +820,59 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserWithBridge,
                 extensionsEnabled: true,
-                now: t1 + 5_000,
+                now: t0 + 16_000,
+            }),
+            false,
+            'directory mtime change on uninstall must invalidate scan cache immediately within 30s TTL',
+        );
+        assert.equal(readdirCalls, 1, 'uninstalling Tools must rescan extRoot immediately while globalRoot stays cached');
+
+        // 5. 30s TTL fallback: empty folder created first, then manifest.json written inside without parent mtime change
+        fs.mkdirSync(toolsDir, { recursive: true });
+        fs.utimesSync(extRoot, 1_700_000_020, 1_700_000_020);
+        const t1 = t0 + 20_000;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t1,
+            }),
+            false,
+        );
+        fs.writeFileSync(path.join(toolsDir, 'manifest.json'), JSON.stringify({ display_name: '柏宝箱', js: 'dist/index.js' }));
+        fs.utimesSync(extRoot, 1_700_000_020, 1_700_000_020);
+
+        readdirCalls = 0;
+        readFileCalls = 0;
+        const t2 = t1 + 31_000;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t2,
             }),
             true,
         );
-        assert.equal(readdirCalls, 0, 'repeated call within 30s must not call readdirSync');
-        assert.equal(readFileCalls, 0, 'repeated call within 30s must not call readFileSync');
+        assert.ok(readdirCalls > 0, 'expired 30s TTL must rescan even if parent mtime did not change');
 
-        // 4. Disabling Tools in settingsText immediately returns false (disabledExtensions is never cached):
-        //    extRoot hits cache (0 IO), globalRoot's t0 cache expired so it rescans once, then subsequent calls do 0 IO.
+        readdirCalls = 0;
+        readFileCalls = 0;
+        assert.equal(
+            hasActiveLazyThemeHydrator(req, '{}', {
+                globalExtensionsDir: globalRoot,
+                powerUserPath: powerUserWithBridge,
+                extensionsEnabled: true,
+                now: t2 + 5_000,
+            }),
+            true,
+        );
+        assert.equal(readdirCalls, 0);
+        assert.equal(readFileCalls, 0);
+
+        // 6. Disabling Tools in settingsText immediately returns false (disabledExtensions is never cached):
+        //    extRoot hits t2 cache (0 IO), globalRoot's t0 cache expired so it rescans once, then subsequent calls do 0 IO.
         const disabledSettings = JSON.stringify({
             extension_settings: {
                 disabledExtensions: ['third-party/ST-BaiBai-Tools'],
@@ -834,7 +883,7 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserWithBridge,
                 extensionsEnabled: true,
-                now: t1 + 6_000,
+                now: t2 + 6_000,
             }),
             false,
         );
@@ -847,31 +896,31 @@ test('WP-K-4: hasActiveLazyThemeHydrator caches extension scans for 30s, avoids 
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserWithBridge,
                 extensionsEnabled: true,
-                now: t1 + 6_500,
+                now: t2 + 6_500,
             }),
             false,
         );
         assert.equal(readdirCalls, 0);
         assert.equal(readFileCalls, 0);
 
-        // 5. Global extensionsEnabled === false -> false
+        // 7. Global extensionsEnabled === false -> false
         assert.equal(
             hasActiveLazyThemeHydrator(req, '{}', {
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserWithBridge,
                 extensionsEnabled: false,
-                now: t1 + 7_000,
+                now: t2 + 7_000,
             }),
             false,
         );
 
-        // 6. Anchor mismatch recorded by installThemeBridge -> returns false with zero sync IO
+        // 8. Anchor mismatch recorded by installThemeBridge -> returns false with zero sync IO
         assert.equal(
             hasActiveLazyThemeHydrator(req, '{}', {
                 globalExtensionsDir: globalRoot,
                 powerUserPath: powerUserAnchorMismatch,
                 extensionsEnabled: true,
-                now: t1 + 8_000,
+                now: t2 + 8_000,
             }),
             false,
         );
