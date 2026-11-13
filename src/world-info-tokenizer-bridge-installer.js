@@ -89,7 +89,7 @@ export function patchWorldInfoJs(source) {
         '                    const content = typeof entry?.content === \'string\' ? entry.content : \'\';',
         '                    return {',
         '                        content,',
-        '                        hasMacros: content.includes(\'{{\') || /<(?:USER|CHAR|BOT)>/i.test(content),',
+        '                        hasMacros: content.includes(\'{{\') || /<(?:USER|BOT|CHAR|CHARIFNOTGROUP|GROUP)>/i.test(content),',
         '                        ignoreBudget: Boolean(entry?.ignoreBudget),',
         '                        maySkip: Boolean(entry?.useProbability && entry?.probability !== 100 && !timedEffects.isEffectActive(\'sticky\', entry)),',
         '                    };',
