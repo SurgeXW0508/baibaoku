@@ -133,7 +133,7 @@ enableServerPluginsAutoUpdate: false
   - 非 `personal/*` 的普通合法分支若缺少 `branch.<name>.merge` 配置，仅当**权威线路**确认远端存在 `origin/<同名分支>` 时才允许按同名分支检查或更新，并在更新成功后自动补写 `branch.<name>.remote`、`branch.<name>.merge` 与 `remote.origin.fetch`（`system` 与 `builtin` 双后端一致）；若远端不存在同名分支，仍报 `NO_UPSTREAM` 拦截。
   - 任何情况下（包括 `force: true` 强制更新）都**不会**自动切回远端默认分支（如 `main`），避免误切回未裁剪的上游主线；提示信息仅展示相对扩展路径（`extensions/<folder>` 或 `public/scripts/extensions/third-party/<folder>`）。
 - **主题懒加载耦合与自动兜底**：
-  - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果做 30 秒 TTL 缓存（禁用列表每次实时从设置解析）；检测到未安装/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动回退下发完整主题列表，避免单独禁用柏宝箱后无法切换主题。
+  - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果以目录 `mtimeMs` 校验配合 30 秒 TTL 兜底缓存（`FX2-1`，禁用列表每次实时从设置解析；世界书 Tokenizer 桥接宏门控同步覆盖旧式 `<CHARIFNOTGROUP>/<GROUP>`，`FX2-2`，详以 ST canonical 规范为准）；检测到未安装/刚卸载/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动立即回退下发完整主题列表，避免单独禁用或卸载柏宝箱后无法切换主题。
 
 ## 8. 代码任务结束时的部署交接
 
