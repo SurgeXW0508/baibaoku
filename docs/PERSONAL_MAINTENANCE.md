@@ -10,19 +10,18 @@
 
 | 项目 | 实际位置 / 状态 |
 | --- | --- |
-| NAS 宿主机目录 | `/vol3/1000/SillyTavern/plugins/baibaoku` |
+| NAS 宿主机目录 | `<NAS_ST_COMPOSE_DIR>/plugins/baibaoku` |
 | 容器内目录 | `/home/node/app/plugins/baibaoku` |
-| Docker 挂载 | 宿主机 `plugins` 目录挂载到 `/home/node/app/plugins`，读写 |
+| Docker 挂载 | 宿主机 Compose 项目下 `./plugins` 目录挂载到 `/home/node/app/plugins`，读写 |
 | Server Plugin 开关 | `enableServerPlugins: true` |
 | Server Plugin 自动更新 | `enableServerPluginsAutoUpdate: false` |
-| NAS 当前 Git HEAD（2026-11-12 快照） | `4814830f2d161dfff89e75370effa31d669586d9`（`personal/stable`，NAS 尚未执行后续拉取） |
-| GitHub origin/personal/stable | 已合入个人分支 Runtime 加固（如 `61aae569` / Runtime `9d9854ca`），每次更新前先 `git fetch` 读取实时 HEAD |
-| NAS 当前运行代码基线 | `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`（`0.7.3`，2026-11-12 切换时仅检出文档提交） |
+| 当前发布配对 Runtime 基线 | `e9d95265c77187446177e839a2b97975ebb2aa0d`（`0.7.4`，配对 `v1.19.0-personal.2`，相对 `0.7.3` 无新增运行时依赖） |
+| 更新前 NAS 历史快照（2026-11-12） | HEAD `4814830f2d161dfff89e75370effa31d669586d9` / Runtime `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`（`0.7.3`） |
 | NAS 当前 Git 状态 | `personal/stable`，跟踪 `origin/personal/stable`，工作区干净 |
 | NAS 当前 origin | `https://github.com/SurgeXW0508/baibaoku.git`（个人 Fork） |
 | NAS 当前 upstream | `https://github.com/baibai-git/baibaoku.git`（原作者） |
 | 本地备份分支 | `backup/pre-personal-stable-20261112`，指向原 Runtime 基线 `b211a4e9` |
-| NAS 本地 main（2026-11-12 快照） | 跟踪 `upstream/main`，非生产分支，不参与部署（GitHub 个人 Fork `main` 已同步至上游 `0.7.4`） |
+| NAS 本地 main（历史快照） | 跟踪 `upstream/main`，非生产分支，不参与部署（GitHub 个人 Fork `main` 已同步至上游 `0.7.4`） |
 
 因此，更新柏宝库的 Git 文件不会要求重新构建 SillyTavern Docker 镜像；但 Server Plugin 已在 Node 进程启动时加载，更新后必须重启 SillyTavern 容器，并刷新浏览器页面。
 
@@ -37,7 +36,7 @@
 | `main` | 上游同步镜像 | 只同步 `baibai-git/baibaoku:main`，不放个人 Runtime 改动 |
 | `personal/stable` | NAS 生产分支 | 唯一允许部署到 NAS 的分支；更新前必须完成兼容审查和测试 |
 
-`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建（初始基线 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`），并于同日在 NAS 完成 remote/branch 切换（检出仅含维护文档的 `4814830f2d161dfff89e75370effa31d669586d9`，当时未改动运行期代码或重启容器）。自 2026-11-13 起，GitHub `personal/stable`（如 `61aae569` / Runtime `9d9854ca`）及候选分支（如 `candidate/baibai-0.7.4`）**已包含经审查的个人 Runtime 与前端桥接加固改动**，不再与上游 Runtime 等价；待三库统一发版节点再按第 4 节定向拉取并重启容器。
+`personal/stable` 于 2026-11-12 从个人 Fork 的 `main` 创建（初始基线 `b211a4e97fdaec24dc8b90c85ddc198fac9ac200`），并于同日在 NAS 完成 remote/branch 切换（检出仅含维护文档的 `4814830f2d161dfff89e75370effa31d669586d9`，当时未改动运行期代码或重启容器）。自 2026-11-13 至 2026-11-14 起，GitHub `personal/stable` **已合入经审查的 `0.7.4` 个人 Runtime 与前端桥接加固改动**（Runtime 基线 `e9d95265c77187446177e839a2b97975ebb2aa0d`，临时候选分支已清理），不再与上游 Runtime 等价；日常每次更新前均先 `git fetch` 读取实时 HEAD，并按第 4 节定向拉取后重启容器。
 
 ### 上游更新流程
 
@@ -95,9 +94,9 @@
    git -C /home/node/app/plugins/baibaoku pull --ff-only origin personal/stable
    ```
 
-4. 检查本次提交是否改变 `package.json` 或 lockfile。只有运行时依赖确实变化时，才在插件目录按仓库安装说明执行生产依赖安装（当前 README 使用 `npm install --omit=dev`）。依赖安装失败时停止，不要继续重启并假定更新成功。
-5. 回到飞牛 OS Docker 图形界面，重启 `sillytavern` 容器。不要只刷新浏览器；Server Plugin 代码在 Node 进程启动时加载。
-6. 浏览器刷新后检查 `/api/plugins/baibaoku/v1/status`，确认 `ok`、版本号和数据库驱动状态，再做本次改动涉及的最小功能验证。
+4. 检查本次提交是否改变 `package.json` 的 `dependencies` / `optionalDependencies` 或 lockfile。只有运行时生产依赖确实变化时，才在插件目录按仓库安装说明执行生产依赖安装（当前 README 使用 `npm install --omit=dev`；例如 `0.7.3` → `0.7.4` 仅升级版本号与测试脚本，生产依赖未变，无需执行 `npm install`）。依赖安装失败时停止，不要继续重启并假定更新成功。
+5. 回到飞牛 OS Docker 图形界面，重启 `sillytavern` 容器（若与酒馆新镜像同步部署，直接执行 Compose 重新部署即可一并重启生效）。不要只刷新浏览器；Server Plugin 代码在 Node 进程启动时加载。
+6. 查看容器启动日志确认 `[baibaoku] Installed ... bridge` 注入正常（无锚点失配告警），随后在浏览器完整刷新后检查 `/api/plugins/baibaoku/v1/status` 确认 `ok: true`、版本号（如 `0.7.4`）和 `storageBackend` 状态，再做本次改动涉及的最小功能验证。
 
 **不要使用 `node /home/node/app/plugins.js update` 作为柏宝库的日常单独更新命令。** SillyTavern 原生脚本会遍历并更新 `plugins` 目录下的所有 Git Server Plugin，不只更新柏宝库。针对单个插件使用上面的显式 `git pull --ff-only origin personal/stable`，更新范围更清楚。
 
@@ -112,7 +111,7 @@ enableServerPluginsAutoUpdate: false
 
 该开关是 SillyTavern 的全局 Server Plugin 自动更新开关。开启它可能同时更新其他 Server Plugin；柏宝库自己的启动自更新也读取这个配置。因此不为了柏宝库单独更新而开启全局自动更新。
 
-柏宝库的 `index.js` 在插件初始化时加载主模块，并在启动阶段幂等检查/注入 5 处宿主前端桥接（`public/index.html` 早期桥接、`public/scripts/power-user.js` 主题桥、`public/scripts/extensions/regex/engine.js` 正则桥、`public/scripts/openai.js` 与 `public/scripts/world-info.js` Tokenizer 桥）；因此更新柏宝库或升级酒馆镜像后必须重启 SillyTavern 容器、确认 `/api/plugins/baibaoku/v1/status` 各项桥接状态正常，并完整刷新浏览器页面。
+柏宝库的 `index.js` 在插件初始化时加载主模块，并在启动阶段幂等检查/注入 5 处宿主前端桥接（`public/index.html` 早期桥接、`public/scripts/power-user.js` 主题桥、`public/scripts/extensions/regex/engine.js` 正则桥、`public/scripts/openai.js` 与 `public/scripts/world-info.js` Tokenizer 桥）；因此更新柏宝库或升级酒馆镜像后必须重启 SillyTavern 容器，通过容器启动日志确认 5 项桥接安装日志正常、检查 `/api/plugins/baibaoku/v1/status` 返回 `ok: true` 及预期版本号，并完整刷新浏览器页面。
 
 ## 6. 回滚与数据安全
 
@@ -138,7 +137,7 @@ enableServerPluginsAutoUpdate: false
 - **主题懒加载耦合、扩展 Manifest 缓存与设置缓存凭据边界**：
   - 主题懒加载由柏宝库在读取设置时剥离非当前主题、柏宝箱前端切换主题时按需水合共同实现。柏宝库在进程内记录 `power-user.js` 主题桥安装状态，并对扩展目录扫描结果以目录 `mtimeMs` 校验配合 30 秒 TTL 兜底缓存（`FX2-1`，禁用列表每次实时从设置解析；世界书 Tokenizer 桥接宏门控同步覆盖旧式 `<CHARIFNOTGROUP>/<GROUP>`，`FX2-2`，详以 ST canonical 规范为准）；检测到未安装/刚卸载/已禁用柏宝箱（`ST-BaiBai-Tools`）或未安装主题桥时，会自动立即回退下发完整主题列表，避免单独禁用或卸载柏宝箱后无法切换主题。
   - `early-bridge` 仅拦截扩展根目录 `/scripts/extensions/third-party/<扩展>/manifest.json`；缓存未命中或扩展子目录内的 `manifest.json` 一律交还酒馆原生静态路由，不伪造 404（`0.7.4`）。同时完全移除对 `window.MutationObserver` 的键盘扫描包装（交由酒馆原生 `keyboard.js` 唯一负责，`chatKeyboardScanReductionEnabled` 固定返回 `false` 并在桥接态同步暴露 `initialFastConfig`），移除客户端基于 32 位哈希的跨请求 `/api/settings/save` 缓存跳过（仅保留并发同体且无异体插队的请求合并，交由后端精确字节比对落盘）；快速设置保存通过单调序号 `settingsSaveSeq`、发包前 FIFO 门控队列 `settingsSaveDispatchQueue`、客户端纪元请求头 `X-Baibaoku-Save-Seq` 与独立 `handleFastSettingsSave` 端到端保序——重叠的异步 `CompressionStream('gzip')` 准备阶段严格按调用先后移交 `rawFetch` 并在发出瞬间释放门控槽位，服务端 `saveSettingsWithCache` 按每用户客户端纪元拒绝乱序到达的旧序号覆盖新设置，且请求一旦向 `/v1/settings/fast-save` 发出后遇到网络中断、`5xx` 等不确定落盘状态一律清空 `settingsGetCache` 并原样报错/返回，**绝不**自动回退重发 `/api/settings/save` 覆盖后续已保存的新设置；派发前构造异常同样在未被更新序号取代时清空残留 `settingsSavePending` 后再回退原生保存（`S10`），避免后续恢复旧值的同体保存被旧缓存短路。
-  - **快速列表与酒馆原生契约严格对齐（`WP-3` + `WP-4` + `S8`/`S9`）**：`/v1/characters/fast-all` 按每角色 `chats/<角色>` 子目录 `mtimeMs`（含目录删除重置归零）增量校验聊天统计而不再依赖 POSIX 下不会变动的顶层 `chats/` `mtimeMs`，严格对齐酒馆 `readFromV2` + `toShallow` 的旧版 V2 卡根级 `name`/`tags` 回退（`data.name`/`data.tags` 为 `undefined` 时保留根字段，`FAST_CHARACTER_CACHE_SCHEMA = 3` 自动重建旧 SQLite 缓存）、`fav` V2 布尔优先级、`data_size`、`date_added` 与损坏/无名卡剔除及缓存驱逐；`/v1/chats/fast-recent`、`/v1/chats/fast-search` 与 `/v1/chat-backups/fast-list` 共享统一尾行解析（`FAST_SEARCH_CACHE_SCHEMA = 3`、`CHAT_BACKUP_CACHE_SCHEMA = 3`），对非单聊请求强校验 `avatar_url` 单段文件名与 `chats` 根目录包含边界（拒绝 `.`/`..`/空串/路径逃逸并返回 HTTP 400，`S8`），严格对齐酒馆原生 `getChatInfo` 的尾部空行视为空聊天（`[The chat is empty]`）、非空损坏尾行降级预览（`[The message is empty]` + 数值 `stats.mtimeMs` 时间戳）与未强转 `send_date`（`S9`），并回收已删群聊文件缓存；已退役的 `/v1/chats/fast-get` 仅保留 `410 Gone` 响应。
+  - **快速列表与酒馆原生契约严格对齐（`WP-3` + `WP-4` + `S8`/`S9`）**：`/v1/characters/fast-all` 按 `characters/` 目录 `mtimeMs` 判定角色重扫（酒馆自身原子写入会更新目录 `mtimeMs`；若在 NAS 文件管理器/SMB 中原地覆盖同名 PNG，需增删一次文件或切换一次快速列表开关触发重扫），并按每角色 `chats/<角色>` 子目录 `mtimeMs`（含目录删除重置归零）增量校验聊天统计而不再依赖 POSIX 下不会变动的顶层 `chats/` `mtimeMs`，严格对齐酒馆 `readFromV2` + `toShallow` 的旧版 V2 卡根级 `name`/`tags` 回退（`data.name`/`data.tags` 为 `undefined` 时保留根字段，`FAST_CHARACTER_CACHE_SCHEMA = 3` 自动重建旧 SQLite 缓存）、`fav` V2 布尔优先级、`data_size`、`date_added` 与损坏/无名卡剔除及缓存驱逐；`/v1/chats/fast-recent`、`/v1/chats/fast-search` 与 `/v1/chat-backups/fast-list` 共享统一尾行解析（`FAST_SEARCH_CACHE_SCHEMA = 3`、`CHAT_BACKUP_CACHE_SCHEMA = 3`），对非单聊请求强校验 `avatar_url` 单段文件名与 `chats` 根目录包含边界（拒绝 `.`/`..`/空串/路径逃逸并返回 HTTP 400，`S8`），严格对齐酒馆原生 `getChatInfo` 的尾部空行视为空聊天（`[The chat is empty]`）、非空损坏尾行降级预览（`[The message is empty]` + 数值 `stats.mtimeMs` 时间戳）与未强转 `send_date`（`S9`），并回收已删群聊文件缓存；已退役的 `/v1/chats/fast-get` 仅保留 `410 Gone` 响应。
   - `data/<user>/baibaoku/cache/` 中的设置快速载荷缓存会镜像 `extension_settings`（包括柏宝箱内置柏宝砚 / 共享渠道 `baibai_api_channels` 的副渠道明文 API Key），与同用户目录 `settings.json` 处于同一信任边界；副渠道建议使用低权限/限额 Key（个人版柏宝砚仅走显式副渠道，详见柏宝箱 Runbook），备份迁移或导出排障前按敏感凭据同等保护。
 
 ## 8. 大阶段收口时的部署交接
