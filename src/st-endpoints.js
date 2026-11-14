@@ -51,12 +51,12 @@ const FAST_SEARCH_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
 const FAST_SEARCH_CACHE_STORE = 'chats-fast-search';
 const FAST_SEARCH_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
 // Bump when the cached result object shape changes, to invalidate stale entries.
-const FAST_SEARCH_CACHE_SCHEMA = 2;
+const FAST_SEARCH_CACHE_SCHEMA = 3;
 const CHAT_BACKUP_CACHE_DATABASE = FAST_CHARACTER_CACHE_DATABASE;
 const CHAT_BACKUP_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
 const CHAT_BACKUP_CACHE_STORE = 'chat-backups-fast-list';
 const CHAT_BACKUP_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
-const CHAT_BACKUP_CACHE_SCHEMA = 2;
+const CHAT_BACKUP_CACHE_SCHEMA = 3;
 const CHAT_BACKUP_FILE_CONCURRENCY = 16;
 const CHAT_BACKUP_FILE_PREFIX = 'chat_';
 const CHAT_BACKUP_FILE_EXTENSION = '.jsonl';
@@ -822,14 +822,13 @@ async function getFastRecentChatInfo(chatFile, withMetadata = false) {
         throw error;
     }
 
-    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
     const chatData = {
         file_id: parsedPath.name,
         file_name: parsedPath.base,
         file_size: bytes.format(stats.size) ?? '',
         chat_items: 0,
         mes: '[The chat is empty]',
-        last_mes: fallbackLastMes,
+        last_mes: stats.mtimeMs,
     };
 
     if (chatFile.groupId) {
@@ -863,21 +862,19 @@ async function getFastRecentChatInfo(chatFile, withMetadata = false) {
             }
         }
 
-        if (scan.lastLineLength > 0) {
-            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
-            const jsonData = parseJsonLine(lastLine);
-            if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
-                chatData.chat_items = Math.max(0, scan.lineCounter - 1);
-                chatData.mes = jsonData.mes || '[The message is empty]';
-                chatData.last_mes = jsonData.send_date || fallbackLastMes;
-                return chatData;
-            }
-        }
-
-        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat file:', chatFile.filePath);
-        chatData.chat_items = Math.max(scan.lineCounter - 2, 0);
-        chatData.mes = '[The message is empty]';
-        chatData.last_mes = fallbackLastMes;
+        const rawLastLine = scan.lastLineLength > 0
+            ? await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength)
+            : '';
+        const tail = summarizeScannedChatTail(
+            scan,
+            rawLastLine,
+            stats.mtimeMs,
+            chatFile.filePath,
+            '[baibaoku] Found an invalid or corrupted last line in a chat file:',
+        );
+        chatData.chat_items = tail.chatItems;
+        chatData.mes = tail.mes;
+        chatData.last_mes = tail.lastMes;
         return chatData;
     } finally {
         await fileHandle.close();
@@ -949,6 +946,33 @@ function parseJsonLine(line) {
     }
 }
 
+function summarizeScannedChatTail(scan, rawLastLine, mtimeMs, filePath, warnMessage) {
+    const normalizedLastLine = typeof rawLastLine === 'string' ? rawLastLine.replace(/\r$/, '') : '';
+    if (!normalizedLastLine) {
+        return {
+            chatItems: 0,
+            mes: '[The chat is empty]',
+            lastMes: mtimeMs,
+        };
+    }
+
+    const jsonData = parseJsonLine(normalizedLastLine);
+    if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+        return {
+            chatItems: Math.max(0, scan.lineCounter - 1),
+            mes: jsonData.mes || '[The message is empty]',
+            lastMes: jsonData.send_date || new Date(Math.round(mtimeMs)).toISOString(),
+        };
+    }
+
+    console.warn(warnMessage, filePath);
+    return {
+        chatItems: Math.max(scan.lineCounter - 2, 0),
+        mes: '[The message is empty]',
+        lastMes: mtimeMs,
+    };
+}
+
 function getFastSearchPreviewMessage(lastMessage) {
     if (!lastMessage) {
         return '';
@@ -993,12 +1017,11 @@ async function mapFastSearchLimited(items, limit, mapper) {
  */
 async function computeFastSearchResult(chatFilePath, stats) {
     const parsedPath = path.parse(chatFilePath);
-    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
     const result = {
         file_name: parsedPath.name,
         file_size: bytes.format(stats.size) ?? '',
         message_count: 0,
-        last_mes: fallbackLastMes,
+        last_mes: stats.mtimeMs,
         preview_message: '[The chat is empty]',
     };
 
@@ -1010,22 +1033,19 @@ async function computeFastSearchResult(chatFilePath, stats) {
 
     try {
         const scan = await scanJsonlLineInfo(fileHandle, stats.size);
-
-        if (scan.lastLineLength > 0) {
-            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
-            const jsonData = parseJsonLine(lastLine);
-            if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
-                result.message_count = Math.max(0, scan.lineCounter - 1);
-                result.preview_message = getFastSearchPreviewMessage(jsonData.mes || '[The message is empty]');
-                result.last_mes = jsonData.send_date || fallbackLastMes;
-                return result;
-            }
-        }
-
-        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat file:', chatFilePath);
-        result.message_count = Math.max(scan.lineCounter - 2, 0);
-        result.preview_message = '[The message is empty]';
-        result.last_mes = fallbackLastMes;
+        const rawLastLine = scan.lastLineLength > 0
+            ? await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength)
+            : '';
+        const tail = summarizeScannedChatTail(
+            scan,
+            rawLastLine,
+            stats.mtimeMs,
+            chatFilePath,
+            '[baibaoku] Found an invalid or corrupted last line in a chat file:',
+        );
+        result.message_count = tail.chatItems;
+        result.preview_message = getFastSearchPreviewMessage(tail.mes);
+        result.last_mes = tail.lastMes;
         return result;
     } finally {
         await fileHandle.close();
@@ -1169,7 +1189,9 @@ function normalizeChatBackupCacheEntry(value) {
         return null;
     }
 
-    if (typeof value.mes !== 'string' || typeof value.lastMes !== 'string' || !value.lastMes) {
+    const validLastMes = (typeof value.lastMes === 'string' && value.lastMes.length > 0)
+        || Number.isFinite(value.lastMes);
+    if (typeof value.mes !== 'string' || !validLastMes) {
         return null;
     }
 
@@ -1278,36 +1300,27 @@ async function persistChatBackupChanges(req, manager, updatedEntries, deletedKey
 }
 
 async function computeChatBackupSummary(filePath, stats) {
-    const fallbackLastMes = new Date(Math.round(stats.mtimeMs)).toISOString();
     if (stats.size <= 0) {
         return {
             chatItems: 0,
             mes: '[The chat is empty]',
-            lastMes: fallbackLastMes,
+            lastMes: stats.mtimeMs,
         };
     }
 
     const fileHandle = await fs.promises.open(filePath, 'r');
     try {
         const scan = await scanJsonlLineInfo(fileHandle, stats.size);
-        if (scan.lastLineLength > 0) {
-            const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
-            const lastObj = parseJsonLine(lastLine);
-            if (lastObj && (lastObj.name || lastObj.character_name || lastObj.chat_metadata)) {
-                return {
-                    chatItems: Math.max(0, scan.lineCounter - 1),
-                    mes: lastObj.mes || '[The message is empty]',
-                    lastMes: String(lastObj.send_date || fallbackLastMes),
-                };
-            }
-        }
-
-        console.warn('[baibaoku] Found an invalid or corrupted last line in a chat backup file:', filePath);
-        return {
-            chatItems: Math.max(scan.lineCounter - 2, 0),
-            mes: '[The message is empty]',
-            lastMes: fallbackLastMes,
-        };
+        const rawLastLine = scan.lastLineLength > 0
+            ? await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength)
+            : '';
+        return summarizeScannedChatTail(
+            scan,
+            rawLastLine,
+            stats.mtimeMs,
+            filePath,
+            '[baibaoku] Found an invalid or corrupted last line in a chat backup file:',
+        );
     } finally {
         await fileHandle.close();
     }
@@ -1428,16 +1441,44 @@ async function getFastSearchResult(chatFilePath, cache, updatedEntries) {
     return result;
 }
 
-async function collectFastSearchCharacterFiles(req, avatarUrl) {
-    const chatsDir = req.user?.directories?.chats;
-    if (!chatsDir) {
-        return [];
+function createInvalidAvatarUrlError() {
+    const error = new Error('Invalid avatar_url');
+    error.status = 400;
+    return error;
+}
+
+function resolveSafeFastSearchCharacterDir(req, avatarUrl) {
+    if (typeof avatarUrl !== 'string' || !avatarUrl || FAST_SEARCH_FORBIDDEN_REGEXP.test(avatarUrl)) {
+        throw createInvalidAvatarUrlError();
     }
 
-    const characterName = String(avatarUrl).replace('.png', '');
-    const directoryPath = path.join(chatsDir, characterName);
+    const characterName = avatarUrl.replace('.png', '');
+    if (
+        !characterName
+        || characterName === '.'
+        || characterName === '..'
+        || FAST_SEARCH_FORBIDDEN_REGEXP.test(characterName)
+    ) {
+        throw createInvalidAvatarUrlError();
+    }
 
-    if (!fs.existsSync(directoryPath)) {
+    const chatsDir = req.user?.directories?.chats;
+    if (!chatsDir) {
+        return null;
+    }
+
+    const resolvedChatsRoot = path.resolve(chatsDir);
+    const resolvedCharDir = path.resolve(resolvedChatsRoot, characterName);
+    if (!resolvedCharDir.startsWith(resolvedChatsRoot + path.sep)) {
+        throw createInvalidAvatarUrlError();
+    }
+
+    return path.join(chatsDir, characterName);
+}
+
+async function collectFastSearchCharacterFiles(req, avatarUrl) {
+    const directoryPath = resolveSafeFastSearchCharacterDir(req, avatarUrl);
+    if (!directoryPath || !fs.existsSync(directoryPath)) {
         return [];
     }
 
@@ -1448,14 +1489,12 @@ async function collectFastSearchCharacterFiles(req, avatarUrl) {
 }
 
 function getFastSearchCharacterDirPrefix(req, avatarUrl) {
-    const chatsDir = req.user?.directories?.chats;
-    if (!chatsDir || typeof avatarUrl !== 'string') {
+    const directoryPath = resolveSafeFastSearchCharacterDir(req, avatarUrl);
+    if (!directoryPath) {
         return null;
     }
-
-    const characterName = avatarUrl.replace('.png', '');
     // Mirror the join used in collectFastSearchCharacterFiles so cache keys match.
-    return path.join(chatsDir, characterName) + path.sep;
+    return directoryPath + path.sep;
 }
 
 function getFastSearchGroupChatsDirPrefix(req) {
@@ -1470,7 +1509,7 @@ function getFastSearchGroupChatsDirPrefix(req) {
 async function collectFastSearchGroupFiles(req, groupId) {
     const groupsDir = req.user?.directories?.groups;
     const groupChatsDir = req.user?.directories?.groupChats;
-    if (!groupsDir || !groupChatsDir) {
+    if (!groupsDir || !groupChatsDir || typeof groupId !== 'string' || !groupId) {
         return [];
     }
 
@@ -1494,9 +1533,21 @@ async function collectFastSearchGroupFiles(req, groupId) {
         return [];
     }
 
-    return targetGroup.chats
-        .map(chatId => path.join(groupChatsDir, `${chatId}.jsonl`))
-        .filter(filePath => fs.existsSync(filePath));
+    const resolvedGroupChatsRoot = path.resolve(groupChatsDir);
+    const validFiles = [];
+    for (const chatId of targetGroup.chats) {
+        if (typeof chatId !== 'string' || !chatId || FAST_SEARCH_FORBIDDEN_REGEXP.test(chatId)) {
+            continue;
+        }
+        const filePath = path.join(groupChatsDir, `${chatId}.jsonl`);
+        if (!path.resolve(filePath).startsWith(resolvedGroupChatsRoot + path.sep)) {
+            continue;
+        }
+        if (fs.existsSync(filePath)) {
+            validFiles.push(filePath);
+        }
+    }
+    return validFiles;
 }
 
 async function getFastSearch(req, manager) {
@@ -1521,10 +1572,12 @@ async function getFastSearch(req, manager) {
     }
 
     // Manual path-traversal guard (the plugin router has no validateAvatarUrlMiddleware).
-    if (typeof avatarUrl === 'string' && FAST_SEARCH_FORBIDDEN_REGEXP.test(avatarUrl)) {
-        const error = new Error('Invalid avatar_url');
-        error.status = 400;
-        throw error;
+    if (!groupId) {
+        resolveSafeFastSearchCharacterDir(req, avatarUrl);
+    } else if (avatarUrl !== undefined && avatarUrl !== null && avatarUrl !== '') {
+        if (typeof avatarUrl !== 'string' || FAST_SEARCH_FORBIDDEN_REGEXP.test(avatarUrl)) {
+            throw createInvalidAvatarUrlError();
+        }
     }
 
     const chatFiles = groupId
@@ -4473,6 +4526,10 @@ export function makeEarlyBridgeScript(options = {}) {
       var preMessage = preError && preError.message ? preError.message : String(preError);
       state.requests.errors += 1;
       state.lastError = preMessage;
+      if (state.settingsSavePending && saveSeq >= state.settingsSavePending.latestSaveSeq) {
+        state.settingsSavePending = null;
+        state.lastSaveInvalidationReason = 'save-pre-error';
+      }
       if (state.settingsSaveSeq === saveSeq) {
         return runFallbackSettingsSave(input, init);
       }

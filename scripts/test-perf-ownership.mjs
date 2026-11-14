@@ -1592,22 +1592,25 @@ test('WP-3 Chain 2a: /v1/chats/fast-recent and /v1/chats/fast-search emit degrad
 
         assert.equal(recentById.get('01_empty').chat_items, 0);
         assert.equal(recentById.get('01_empty').mes, '[The chat is empty]');
-        assert.equal(recentById.get('01_empty').last_mes, new Date(Math.round(fs.statSync(emptyFile).mtimeMs)).toISOString());
+        assert.equal(recentById.get('01_empty').last_mes, fs.statSync(emptyFile).mtimeMs);
 
         assert.equal(recentById.get('02_valid_nl').chat_items, 1);
         assert.equal(recentById.get('02_valid_nl').mes, 'Valid message');
         assert.equal(recentById.get('02_valid_nl').last_mes, '2026-06-01T10:00:00.000Z');
         assert.deepEqual(recentById.get('02_valid_nl').chat_metadata, { note: 'meta' });
 
-        assert.equal(recentById.get('03_blank_tail').chat_items, 1, 'blank trailing line must exclude header + blank tail');
-        assert.equal(recentById.get('03_blank_tail').mes, '[The message is empty]');
-        assert.equal(recentById.get('03_blank_tail').last_mes, new Date(Math.round(fs.statSync(blankTailFile).mtimeMs)).toISOString());
+        // Native getChatInfo treats trailing blank line (readline lastLine === "") identically to empty chat
+        assert.equal(recentById.get('03_blank_tail').chat_items, 0);
+        assert.equal(recentById.get('03_blank_tail').mes, '[The chat is empty]');
+        assert.equal(recentById.get('03_blank_tail').last_mes, fs.statSync(blankTailFile).mtimeMs);
 
         assert.equal(recentById.get('04_corrupt_2').chat_items, 0, '2-line header+corrupt must report 0 valid messages');
         assert.equal(recentById.get('04_corrupt_2').mes, '[The message is empty]');
+        assert.equal(recentById.get('04_corrupt_2').last_mes, fs.statSync(corruptTwoLines).mtimeMs);
 
         assert.equal(recentById.get('05_corrupt_3').chat_items, 1, '3-line header+msg+corrupt must report 1 valid message');
         assert.equal(recentById.get('05_corrupt_3').mes, '[The message is empty]');
+        assert.equal(recentById.get('05_corrupt_3').last_mes, fs.statSync(corruptThreeLines).mtimeMs);
 
         const searchRes = await harness.invoke('POST', '/v1/chats/fast-search', {
             user,
@@ -1618,14 +1621,27 @@ test('WP-3 Chain 2a: /v1/chats/fast-recent and /v1/chats/fast-search emit degrad
         assert.equal(searchByName.size, 5, 'fast-search must return all 5 chat files including recomputed null cache entry');
         assert.equal(searchByName.get('01_empty').message_count, 0);
         assert.equal(searchByName.get('01_empty').preview_message, '[The chat is empty]');
+        assert.equal(searchByName.get('01_empty').last_mes, fs.statSync(emptyFile).mtimeMs);
         assert.equal(searchByName.get('02_valid_nl').message_count, 1);
         assert.equal(searchByName.get('02_valid_nl').preview_message, 'Valid message');
-        assert.equal(searchByName.get('03_blank_tail').message_count, 1);
-        assert.equal(searchByName.get('03_blank_tail').preview_message, '[The message is empty]');
+        assert.equal(searchByName.get('03_blank_tail').message_count, 0);
+        assert.equal(searchByName.get('03_blank_tail').preview_message, '[The chat is empty]');
+        assert.equal(searchByName.get('03_blank_tail').last_mes, fs.statSync(blankTailFile).mtimeMs);
         assert.equal(searchByName.get('04_corrupt_2').message_count, 0);
         assert.equal(searchByName.get('04_corrupt_2').preview_message, '[The message is empty]');
+        assert.equal(searchByName.get('04_corrupt_2').last_mes, fs.statSync(corruptTwoLines).mtimeMs);
         assert.equal(searchByName.get('05_corrupt_3').message_count, 1);
         assert.equal(searchByName.get('05_corrupt_3').preview_message, '[The message is empty]');
+        assert.equal(searchByName.get('05_corrupt_3').last_mes, fs.statSync(corruptThreeLines).mtimeMs);
+
+        // S8: Non-string, dot-segment, empty, or path-escaping avatar_url MUST be rejected with HTTP 400
+        for (const badAvatar of [['../../otheruser/chats/Alice'], '..', '.', '.png', '', null, 123, 'Hero/sub.png']) {
+            const badRes = await harness.invoke('POST', '/v1/chats/fast-search', {
+                user,
+                body: { query: '', avatar_url: badAvatar },
+            });
+            assert.equal(badRes.status, 400, `malformed avatar_url ${JSON.stringify(badAvatar)} must return 400`);
+        }
 
         // Group chat GC test: deleting a group chat file removes its cache key without touching other groups' existing chats
         const gc1Path = path.join(groupChatsDir, 'gc_g1_keep.jsonl');
@@ -1671,7 +1687,7 @@ test('WP-3 Chain 2a: /v1/chats/fast-recent and /v1/chats/fast-search emit degrad
     }
 });
 
-test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, and file_id with native /api/backups/chat/get parity and invalidates legacy schema=1 cache', async () => {
+test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, and file_id with native /api/backups/chat/get parity and invalidates legacy schema=2 cache', async () => {
     const dbManager = new DatabaseManager();
     try {
         closeStEndpointCaches();
@@ -1680,6 +1696,7 @@ test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, an
         const { backups: backupsDir } = user.directories;
 
         const b1 = path.join(backupsDir, 'chat_Hero_20260101.jsonl');
+        const bNumeric = path.join(backupsDir, 'chat_Hero_numeric.jsonl');
         const bEmpty = path.join(backupsDir, 'chat_Hero_empty.jsonl');
         const bCorrupt = path.join(backupsDir, 'chat_Hero_corrupt.jsonl');
 
@@ -1687,28 +1704,34 @@ test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, an
             b1,
             '{"chat_metadata":{}}\n{"name":"Hero","mes":"Restored greeting","send_date":"2026-02-14T08:30:00.000Z"}\n',
         );
+        fs.writeFileSync(
+            bNumeric,
+            '{"chat_metadata":{}}\n{"name":"Hero","mes":"Legacy epoch send_date","send_date":1700000000000}\n',
+        );
         const olderMtime = new Date('2025-01-01T00:00:00.000Z');
         fs.utimesSync(b1, olderMtime, olderMtime);
         fs.writeFileSync(bEmpty, '');
         fs.writeFileSync(bCorrupt, '{"chat_metadata":{}}\n{"name":"Hero","mes":"Msg 1"}\n{broken_tail');
 
-        // Seed stale schema=1 row lacking send_date/mes
+        // Seed stale schema=2 row lacking schema=3 parity
         const b1Stat = fs.statSync(b1);
         await dbManager.openForRequest({ user }, 'baibaoku.internal', { displayName: 'BaiBaoKu internal cache', version: 1 });
         await dbManager.set({ user }, 'baibaoku.internal', 'chat-backups-fast-list', 'chat_Hero_20260101.jsonl', {
-            schema: 1,
+            schema: 2,
             mtime: b1Stat.mtimeMs,
             size: b1Stat.size,
             chatItems: 1,
+            mes: 'Stale mes',
+            lastMes: '2020-01-01T00:00:00.000Z',
         });
         closeStEndpointCaches();
 
         const res1 = await harness.invoke('POST', '/v1/chat-backups/fast-list', { user });
         assert.equal(res1.status, 200);
-        assert.equal(res1.headers.get('x-baibaoku-cache-misses'), '3', 'legacy schema=1 backup cache entry must recompute');
+        assert.equal(res1.headers.get('x-baibaoku-cache-misses'), '4', 'legacy schema=2 backup cache entry must recompute');
 
         const byName = new Map(res1.body.map(item => [item.file_name, item]));
-        assert.equal(byName.size, 3);
+        assert.equal(byName.size, 4);
 
         const row1 = byName.get('chat_Hero_20260101.jsonl');
         assert.equal(row1.file_id, 'chat_Hero_20260101');
@@ -1716,21 +1739,25 @@ test('WP-3 Chain 2b: /v1/chat-backups/fast-list extracts tail send_date, mes, an
         assert.equal(row1.mes, 'Restored greeting');
         assert.equal(row1.last_mes, '2026-02-14T08:30:00.000Z', 'last_mes must come from tail send_date rather than file mtimeMs');
 
+        const rowNumeric = byName.get('chat_Hero_numeric.jsonl');
+        assert.equal(rowNumeric.last_mes, 1700000000000, 'numeric send_date must be preserved without String() coercion');
+
         const rowEmpty = byName.get('chat_Hero_empty.jsonl');
         assert.equal(rowEmpty.file_id, 'chat_Hero_empty');
         assert.equal(rowEmpty.chat_items, 0);
         assert.equal(rowEmpty.mes, '[The chat is empty]');
-        assert.equal(rowEmpty.last_mes, new Date(Math.round(fs.statSync(bEmpty).mtimeMs)).toISOString());
+        assert.equal(rowEmpty.last_mes, fs.statSync(bEmpty).mtimeMs);
 
         const rowCorrupt = byName.get('chat_Hero_corrupt.jsonl');
         assert.equal(rowCorrupt.file_id, 'chat_Hero_corrupt');
         assert.equal(rowCorrupt.chat_items, 1);
         assert.equal(rowCorrupt.mes, '[The message is empty]');
-        assert.equal(rowCorrupt.last_mes, new Date(Math.round(fs.statSync(bCorrupt).mtimeMs)).toISOString());
+        assert.equal(rowCorrupt.last_mes, fs.statSync(bCorrupt).mtimeMs);
 
-        // Second call must hit schema=2 cache with identical fields
+        // Second call must hit schema=3 cache with identical fields (including numeric last_mes!)
+        closeStEndpointCaches();
         const res2 = await harness.invoke('POST', '/v1/chat-backups/fast-list', { user });
-        assert.equal(res2.headers.get('x-baibaoku-cache-hits'), '3');
+        assert.equal(res2.headers.get('x-baibaoku-cache-hits'), '4');
         assert.deepEqual(res2.body, res1.body);
     } finally {
         closeStEndpointCaches();
@@ -1936,9 +1963,11 @@ test('WP-2 Round 2: Early Bridge fast-save monotonic settingsSaveSeq prevents po
                 const pathname = new URL(url, 'http://127.0.0.1:8000').pathname;
                 const rawBody = typeof init.body === 'string'
                     ? init.body
-                    : (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
-                        ? new TextDecoder().decode(init.body)
-                        : '{}');
+                    : (typeof init.body?._fallbackJson === 'string'
+                        ? init.body._fallbackJson
+                        : (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
+                            ? new TextDecoder().decode(init.body)
+                            : '{}'));
 
                 if (pathname === '/api/plugins/baibaoku/v1/settings/fast-get') {
                     fastGetCalls += 1;
@@ -2220,6 +2249,55 @@ test('WP-2 Round 2: Early Bridge fast-save monotonic settingsSaveSeq prevents po
         await assert.rejects(preErrPromise, /Blob read failed/);
         assert.equal(nativeSaveCalls, nativeCallsBeforePreErr, 'superseded pre-dispatch error must not call native fallback');
         assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetG_AfterPreError');
+
+        // 2c-ii (S10). Save A(X) in flight -> Save B(Y) throws pre-dispatch & falls back to native -> Save C(X) MUST NOT coalesce onto stale A(X)!
+        let resolveHeldAForS10;
+        let markADispatchedForS10;
+        const aDispatchedForS10 = new Promise(resolve => { markADispatchedForS10 = resolve; });
+        const payloadS10X = JSON.stringify({ active_preset: 'PresetX_S10' });
+        let xFastSaveCount = 0;
+        fastSaveResponder = async (rawBody) => {
+            const parsed = JSON.parse(rawBody);
+            const res = await harness.invoke('POST', '/v1/settings/fast-save', { user, body: parsed });
+            if (parsed.active_preset === 'PresetX_S10' && ++xFastSaveCount === 1) {
+                markADispatchedForS10();
+                return await new Promise((resolve) => {
+                    resolveHeldAForS10 = resolve;
+                });
+            }
+            return new Response(JSON.stringify(res.body), {
+                status: res.status,
+                headers: { 'content-type': 'application/json' },
+            });
+        };
+
+        const saveAS10 = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadS10X });
+        await aDispatchedForS10;
+        assert.ok(bridge.settingsSavePending, 'Save A(X) populates settingsSavePending');
+
+        // Save B(Y): body.text() throws inside handleFastSettingsSave pre-dispatch while A(X) is STILL in flight,
+        // so B(Y) falls back to native /api/settings/save and writes PresetY_S10_Fallback to disk!
+        const payloadS10Y = JSON.stringify({ active_preset: 'PresetY_S10_Fallback' });
+        const throwingBodyB = Object.create(Blob.prototype);
+        throwingBodyB._fallbackJson = payloadS10Y;
+        throwingBodyB.text = () => Promise.reject(new Error('Pre-dispatch read failure'));
+        const saveBS10Res = await windowObj.fetch('/api/settings/save', { method: 'POST', body: throwingBodyB });
+        assert.equal(saveBS10Res.ok, true);
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetY_S10_Fallback');
+        assert.equal(bridge.settingsSavePending, null, 'Unsuperseded pre-dispatch catch MUST clear settingsSavePending before native fallback');
+        assert.equal(bridge.lastSaveInvalidationReason, 'save-pre-error');
+
+        // Save C(X) now dispatches a fresh fast-save (xFastSaveCount === 2) instead of coalescing onto stale A(X)!
+        const saveCS10Res = await windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadS10X });
+        assert.equal(saveCS10Res.ok, true);
+        assert.equal(xFastSaveCount, 2, 'Save C(X) must dispatch fresh fast-save rather than coalescing onto Save A(X)');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetX_S10');
+
+        resolveHeldAForS10(new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        }));
+        await saveAS10;
 
         // 2d. Verify 405 and 501 also act as definite pre-write route-unavailable statuses when unsuperseded
         for (const unmountedStatus of [405, 501]) {
