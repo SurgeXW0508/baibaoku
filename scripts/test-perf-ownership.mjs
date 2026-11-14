@@ -9,6 +9,7 @@ import process from 'node:process';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
+import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
@@ -2502,6 +2503,261 @@ test('WP-4 Round 2: Legacy V2 character cards without data.name/data.tags match 
         dbManager.closeAll();
     }
 });
+
+test('WP-2 Round 3: Early Bridge fast-save preserves newer settings when older save prepares/compresses slower with real CompressionStream and both responses succeed', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp2-r3-dispatch-order-user');
+        const settingsPath = path.join(user.directories.root, 'settings.json');
+        fs.writeFileSync(settingsPath, JSON.stringify({ active_preset: 'Initial', temp: 0.4 }, null, 4));
+
+        const dispatchedOrder = [];
+        let delayFirstSaveArrivalPromise = null;
+        let compressionCallCount = 0;
+
+        // Wrap real CompressionStream so Save #1 genuinely compresses through CompressionStream('gzip')
+        // AND deterministically finishes compressing AFTER Save #2's real CompressionStream('gzip') finishes!
+        let markSecondCompressionDone;
+        const secondCompressionDone = new Promise(resolve => { markSecondCompressionDone = resolve; });
+
+        class ControlledRealCompressionStream {
+            constructor(format) {
+                const callIndex = ++compressionCallCount;
+                const realStream = new CompressionStream(format);
+                if (callIndex !== 1) {
+                    const reader = realStream.readable.getReader();
+                    const passthrough = new ReadableStream({
+                        async pull(controller) {
+                            const chunk = await reader.read();
+                            if (chunk.done) {
+                                controller.close();
+                                if (callIndex === 2) {
+                                    markSecondCompressionDone();
+                                }
+                                return;
+                            }
+                            controller.enqueue(chunk.value);
+                        },
+                    });
+                    this.writable = realStream.writable;
+                    this.readable = passthrough;
+                    return;
+                }
+
+                const reader = realStream.readable.getReader();
+                this.writable = realStream.writable;
+                this.readable = new ReadableStream({
+                    async pull(controller) {
+                        const chunk = await reader.read();
+                        if (chunk.done) {
+                            await secondCompressionDone;
+                            await new Promise(resolve => setTimeout(resolve, 15));
+                            controller.close();
+                            return;
+                        }
+                        controller.enqueue(chunk.value);
+                    },
+                });
+            }
+        }
+
+        const windowObj = {
+            // Non-private Tailscale/remote origin so gzipFastSaveInit exercises real CompressionStream('gzip')
+            location: new URL('http://100.64.0.10:8000/'),
+            Response,
+            Headers,
+            Request,
+            Blob,
+            URL,
+            URLSearchParams,
+            TextEncoder,
+            TextDecoder,
+            CompressionStream: ControlledRealCompressionStream,
+            Promise,
+            setTimeout,
+            clearTimeout,
+            document: {
+                readyState: 'complete',
+                body: {},
+                addEventListener: () => {},
+                documentElement: null,
+            },
+            fetch: async (input, init = {}) => {
+                const url = typeof input === 'string' ? input : input.url;
+                const pathname = new URL(url, 'http://100.64.0.10:8000').pathname;
+                const reqHeaders = new Headers(init.headers || undefined);
+
+                if (pathname === '/api/plugins/baibaoku/v1/settings/fast-get') {
+                    const text = fs.readFileSync(settingsPath, 'utf8');
+                    return new Response(JSON.stringify({ settings: text, themes: [] }), {
+                        status: 200,
+                        headers: { 'content-type': 'application/json' },
+                    });
+                }
+
+                if (pathname === '/api/plugins/baibaoku/v1/settings/fast-save') {
+                    const encoding = reqHeaders.get('content-encoding') || 'identity';
+                    let decodedText;
+                    if (encoding === 'gzip') {
+                        const buf = init.body instanceof ArrayBuffer
+                            ? Buffer.from(init.body)
+                            : Buffer.from(init.body.buffer, init.body.byteOffset, init.body.byteLength);
+                        decodedText = zlib.gunzipSync(buf).toString('utf8');
+                    } else {
+                        decodedText = typeof init.body === 'string'
+                            ? init.body
+                            : new TextDecoder().decode(init.body);
+                    }
+
+                    const parsed = JSON.parse(decodedText);
+                    const saveSeqHeader = reqHeaders.get('x-baibaoku-save-seq') || '';
+                    dispatchedOrder.push({
+                        preset: parsed.active_preset,
+                        encoding,
+                        saveSeqHeader,
+                    });
+
+                    if (delayFirstSaveArrivalPromise && parsed.delayServerArrival === true) {
+                        await delayFirstSaveArrivalPromise;
+                    }
+
+                    const headerObj = {};
+                    reqHeaders.forEach((value, key) => {
+                        headerObj[key] = value;
+                    });
+                    const res = await harness.invoke('POST', '/v1/settings/fast-save', {
+                        user,
+                        body: parsed,
+                        headers: headerObj,
+                    });
+                    const outHeaders = { 'content-type': 'application/json' };
+                    if (res.headers.get('x-baibaoku-save-skipped')) {
+                        outHeaders['x-baibaoku-save-skipped'] = res.headers.get('x-baibaoku-save-skipped');
+                    }
+                    if (res.headers.get('x-baibaoku-save-superseded')) {
+                        outHeaders['x-baibaoku-save-superseded'] = res.headers.get('x-baibaoku-save-superseded');
+                    }
+                    return new Response(JSON.stringify(res.body), { status: res.status, headers: outHeaders });
+                }
+
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                });
+            },
+        };
+        windowObj.window = windowObj;
+        windowObj.globalThis = windowObj;
+
+        const script = makeEarlyBridgeScript({
+            settingsAccelerationEnabled: true,
+            lazyThemeLoadingEnabled: false,
+            characterListAccelerationEnabled: false,
+            recentChatListAccelerationEnabled: false,
+            tokenizerBulkCountEnabled: false,
+            extensionManifestBundleEnabled: false,
+            versionAccelerationEnabled: false,
+        });
+        vm.runInNewContext(script, windowObj);
+
+        // Prime client settingsGetCache with 'Initial'
+        const primed = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(JSON.parse(primed.settings).active_preset, 'Initial');
+
+        // 1. Exact Reviewer P1 #2: Save A starts first and compresses slower via real CompressionStream('gzip');
+        //    Save B starts second and finishes compressing first; BOTH responses succeed (200 OK).
+        const repeatedFiller = 'compressible-settings-payload-block-'.repeat(40);
+        const payloadA = JSON.stringify({ active_preset: 'StalePresetA', filler: repeatedFiller, temp: 0.7 });
+        const payloadB = JSON.stringify({ active_preset: 'NewerPresetB', filler: repeatedFiller, temp: 1.2 });
+
+        const saveAPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadA });
+        const saveBPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadB });
+        const [resA, resB] = await Promise.all([saveAPromise, saveBPromise]);
+
+        assert.equal(resA.ok, true);
+        assert.equal(resB.ok, true);
+        assert.equal(dispatchedOrder.length, 2);
+        assert.equal(dispatchedOrder[0].encoding, 'gzip', 'Save A must exercise real gzip compression');
+        assert.equal(dispatchedOrder[1].encoding, 'gzip', 'Save B must exercise real gzip compression');
+        assert.deepEqual(
+            dispatchedOrder.map(item => item.preset),
+            ['StalePresetA', 'NewerPresetB'],
+            'Pre-dispatch gate must dispatch Save A before Save B even when Save B finishes gzip first',
+        );
+        assert.equal(
+            JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset,
+            'NewerPresetB',
+            'Final persisted settings.json must be NewerPresetB, never StalePresetA',
+        );
+        const getAfterAB = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(JSON.parse(getAfterAB.settings).active_preset, 'NewerPresetB');
+
+        // 2. Multi-socket server upload inversion defense-in-depth:
+        //    Save C dispatches onto the wire first, Save D dispatches second, but Save D finishes uploading
+        //    and reaches saveSettingsWithCache BEFORE Save C; both responses succeed (200 OK).
+        let releaseSlowUploadC;
+        delayFirstSaveArrivalPromise = new Promise(resolve => { releaseSlowUploadC = resolve; });
+
+        const payloadC = JSON.stringify({
+            active_preset: 'StalePresetC',
+            filler: repeatedFiller,
+            delayServerArrival: true,
+        });
+        const payloadD = JSON.stringify({
+            active_preset: 'NewerPresetD',
+            filler: repeatedFiller,
+        });
+
+        const saveCPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadC });
+        const saveDPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadD });
+        const resD = await saveDPromise;
+        assert.equal(resD.ok, true);
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'NewerPresetD');
+
+        releaseSlowUploadC();
+        const resC = await saveCPromise;
+        assert.equal(resC.ok, true);
+        assert.equal(resC.headers.get('x-baibaoku-save-skipped'), 'true');
+        assert.equal(resC.headers.get('x-baibaoku-save-superseded'), 'true');
+        assert.equal(
+            JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset,
+            'NewerPresetD',
+            'Server X-Baibaoku-Save-Seq guard must prevent delayed upload C from overwriting NewerPresetD',
+        );
+        delayFirstSaveArrivalPromise = null;
+
+        // 3. Slow async Blob pre-dispatch supersession:
+        //    Save E's Blob.text() resolves AFTER Save F has already dispatched & succeeded.
+        let resolveSlowBlobE;
+        const slowBlobE = Object.create(Blob.prototype);
+        slowBlobE.text = () => new Promise(resolve => { resolveSlowBlobE = resolve; });
+
+        const countBeforeEF = dispatchedOrder.length;
+        const saveEPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: slowBlobE });
+        const resF = await windowObj.fetch('/api/settings/save', {
+            method: 'POST',
+            body: JSON.stringify({ active_preset: 'NewerPresetF', filler: repeatedFiller }),
+        });
+        assert.equal(resF.ok, true);
+        assert.equal(dispatchedOrder.length, countBeforeEF + 1);
+
+        resolveSlowBlobE(JSON.stringify({ active_preset: 'StaleBlobE', filler: repeatedFiller }));
+        const resE = await saveEPromise;
+        assert.equal(resE.ok, true);
+        assert.equal(resE.headers.get('x-baibaoku-save-superseded'), 'true');
+        assert.equal(dispatchedOrder.length, countBeforeEF + 1, 'Superseded slow Blob must never hit the network');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'NewerPresetF');
+        const getAfterEF = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(JSON.parse(getAfterEF.settings).active_preset, 'NewerPresetF');
+    } finally {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
 
 
 

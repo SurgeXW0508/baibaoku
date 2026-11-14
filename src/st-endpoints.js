@@ -103,6 +103,9 @@ const settingsUpdateLocks = new Map();
 const settingsFileCaches = new Map();
 // Lock structure: Map<userHandle, Promise<Object>>
 const settingsSaveLocks = new Map();
+// Monotonic client save sequence guard: Map<userHandle, Map<clientEpoch, number>>
+const settingsClientSaveSeqs = new Map();
+const MAX_CLIENT_SAVE_EPOCHS_PER_USER = 32;
 // Cache structure: Map<userHandle, { key: string, text: string }>
 const settingsResponseCaches = new Map();
 // Scheduler structure: Map<userHandle, { lastBackupAt: number, timer: Timeout|null, pendingPayload: Object|null }>
@@ -1976,7 +1979,63 @@ async function waitForPendingSettingsSave(userHandle) {
     }
 }
 
+function parseSettingsSaveSeqHeader(rawHeader) {
+    if (typeof rawHeader !== 'string' || !rawHeader) {
+        return null;
+    }
+    const separatorIndex = rawHeader.lastIndexOf(':');
+    if (separatorIndex <= 0 || separatorIndex >= rawHeader.length - 1) {
+        return null;
+    }
+    const epoch = rawHeader.slice(0, separatorIndex).trim();
+    const seqText = rawHeader.slice(separatorIndex + 1).trim();
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(epoch) || !/^\d{1,15}$/.test(seqText)) {
+        return null;
+    }
+    const seq = Number(seqText);
+    if (!Number.isSafeInteger(seq) || seq <= 0) {
+        return null;
+    }
+    return { epoch, seq };
+}
+
+function isSupersededClientSaveSeq(userHandle, token) {
+    const epochMap = settingsClientSaveSeqs.get(userHandle);
+    if (!epochMap) {
+        return false;
+    }
+    const committedSeq = epochMap.get(token.epoch) || 0;
+    return token.seq < committedSeq;
+}
+
+function recordCommittedClientSaveSeq(userHandle, token) {
+    let epochMap = settingsClientSaveSeqs.get(userHandle);
+    if (!epochMap) {
+        epochMap = new Map();
+        settingsClientSaveSeqs.set(userHandle, epochMap);
+    }
+    const previousSeq = epochMap.get(token.epoch) || 0;
+    if (token.seq < previousSeq) {
+        return;
+    }
+    // Refresh insertion order for LRU/FIFO bounding across page reloads.
+    epochMap.delete(token.epoch);
+    epochMap.set(token.epoch, token.seq);
+    while (epochMap.size > MAX_CLIENT_SAVE_EPOCHS_PER_USER) {
+        const oldestEpoch = epochMap.keys().next().value;
+        epochMap.delete(oldestEpoch);
+    }
+}
+
 async function saveSettingsWithCache(req, userHandle) {
+    const rawSaveSeqHeader = typeof req?.get === 'function'
+        ? req.get('x-baibaoku-save-seq')
+        : req?.headers?.['x-baibaoku-save-seq'];
+    const saveSeqToken = parseSettingsSaveSeqHeader(rawSaveSeqHeader);
+    if (saveSeqToken && isSupersededClientSaveSeq(userHandle, saveSeqToken)) {
+        return { result: 'ok', skipped: true, superseded: true };
+    }
+
     const settingsPath = getSettingsPath(req);
     const text = JSON.stringify(req.body ?? {}, null, 4);
     let currentStat = null;
@@ -1994,11 +2053,18 @@ async function saveSettingsWithCache(req, userHandle) {
         const currentText = cached ? cached.text : await fs.promises.readFile(settingsPath, 'utf8');
 
         if (currentText === text) {
+            if (saveSeqToken) {
+                recordCommittedClientSaveSeq(userHandle, saveSeqToken);
+            }
             return { result: 'ok', skipped: true };
         }
     }
 
     writeFileAtomicSync(settingsPath, text, 'utf8');
+
+    if (saveSeqToken) {
+        recordCommittedClientSaveSeq(userHandle, saveSeqToken);
+    }
 
     const stat = await fs.promises.stat(settingsPath);
     cacheSettingsText(userHandle, settingsPath, text, stat);
@@ -3599,6 +3665,10 @@ export function makeEarlyBridgeScript(options = {}) {
   state.settingsSaveCache = null;
   state.settingsSavePending = null;
   state.settingsSaveSeq = Number(state.settingsSaveSeq) || 0;
+  state.settingsSaveLastDispatchedSeq = Number(state.settingsSaveLastDispatchedSeq) || 0;
+  state.settingsSaveLastDispatchedSettlement = null;
+  state.settingsSaveDispatchQueue = null;
+  state.settingsSaveClientEpoch = state.settingsSaveClientEpoch || (String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10));
   state.settingsRequestHeaders = state.settingsRequestHeaders || null;
   state.lazyThemesArray = state.lazyThemesArray || null;
   if (!state.lazyThemeFetchPending || typeof state.lazyThemeFetchPending !== 'object') {
@@ -3875,7 +3945,7 @@ export function makeEarlyBridgeScript(options = {}) {
     var next = {};
     try {
       new Headers(headers || undefined).forEach(function (value, key) {
-        if (!/^content-length$/i.test(key)) {
+        if (!/^content-length$/i.test(key) && !/^x-baibaoku-/i.test(key)) {
           next[key] = value;
         }
       });
@@ -4371,23 +4441,33 @@ export function makeEarlyBridgeScript(options = {}) {
     }
   }
 
-  async function bodyToText(body) {
+  function isAsyncBodySource(body) {
+    return typeof Blob !== 'undefined' && body instanceof Blob;
+  }
+
+  function decodeBodyToTextSync(body) {
     if (body === undefined || body === null) return '';
     if (typeof body === 'string') return body;
     if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();
-    if (typeof Blob !== 'undefined' && body instanceof Blob) return await body.text();
     if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
     if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body);
     return null;
   }
 
-  async function gzipFastSaveInit(init) {
+  async function bodyToText(body) {
+    if (isAsyncBodySource(body)) return await body.text();
+    return decodeBodyToTextSync(body);
+  }
+
+  async function gzipFastSaveInit(init, predecodedText) {
     var headers = new Headers(init.headers || undefined);
     if (isLocalOrPrivateHost(location.hostname)) return init;
     if (headers.has('content-encoding')) return init;
     if (typeof CompressionStream !== 'function') return init;
 
-    var text = await bodyToText(init.body);
+    var text = typeof predecodedText === 'string'
+      ? predecodedText
+      : await bodyToText(init.body);
     if (text === null || !text) return init;
 
     try {
@@ -4458,9 +4538,15 @@ export function makeEarlyBridgeScript(options = {}) {
     return state.settingsAccelerationEnabled !== false;
   }
 
-  async function makeFastInit(input, init, method) {
+  function canReadReplayBodySync(input, init, method) {
+    if (method === 'GET' || method === 'HEAD') return true;
+    if (init && Object.prototype.hasOwnProperty.call(init, 'body')) return true;
+    return !(typeof Request !== 'undefined' && input instanceof Request);
+  }
+
+  function buildFastInitBase(input, init, method, bodyValue) {
     var next = {};
-    if (input instanceof Request) {
+    if (typeof Request !== 'undefined' && input instanceof Request) {
       next.credentials = input.credentials;
       next.cache = input.cache;
       next.redirect = input.redirect;
@@ -4478,12 +4564,17 @@ export function makeEarlyBridgeScript(options = {}) {
     }
     next.method = method;
     next.cache = 'no-store';
-    next.body = await getReplayBody(input, init, method);
+    next.body = bodyValue;
     if (!next.headers) next.headers = new Headers();
     if (method !== 'GET' && method !== 'HEAD' && !next.headers.has('content-type')) {
       next.headers.set('content-type', 'application/json');
     }
     return next;
+  }
+
+  async function makeFastInit(input, init, method) {
+    var replayBody = await getReplayBody(input, init, method);
+    return buildFastInitBase(input, init, method, replayBody);
   }
 
   async function callOriginal(input, init) {
@@ -4493,6 +4584,29 @@ export function makeEarlyBridgeScript(options = {}) {
 
   function isRouteUnavailableSaveStatus(status) {
     return status === 404 || status === 405 || status === 501;
+  }
+
+  function trackDispatchedSaveSettlement(fetchPromise) {
+    var settlementPromise = Promise.resolve(fetchPromise).then(
+      function (res) {
+        return {
+          ok: Boolean(res && res.ok),
+          status: res ? res.status : 0,
+          statusText: res ? res.statusText : '',
+          error: null,
+        };
+      },
+      function (err) {
+        return {
+          ok: false,
+          status: 0,
+          statusText: '',
+          error: err || new Error('Settings save failed'),
+        };
+      }
+    );
+    state.settingsSaveLastDispatchedSettlement = settlementPromise;
+    return settlementPromise;
   }
 
   async function runFallbackSettingsSave(input, init) {
@@ -4513,15 +4627,27 @@ export function makeEarlyBridgeScript(options = {}) {
   async function handleFastSettingsSave(route, input, init, method) {
     state.requests.save += 1;
     var saveSeq = (state.settingsSaveSeq = (Number(state.settingsSaveSeq) || 0) + 1);
+    var cacheVersionAtStart = state.settingsGetCacheVersion;
     var fastInit;
     var bodyText;
 
     try {
-      fastInit = await makeFastInit(input, init, method);
+      if (canReadReplayBodySync(input, init, method)) {
+        var syncBody = (method === 'GET' || method === 'HEAD')
+          ? undefined
+          : (init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined);
+        fastInit = buildFastInitBase(input, init, method, syncBody);
+      } else {
+        fastInit = await makeFastInit(input, init, method);
+      }
       rememberSettingsRequestHeaders(fastInit.headers);
-      bodyText = (fastInit.headers && fastInit.headers.has('content-encoding'))
-        ? null
-        : await bodyToText(fastInit.body);
+      if (fastInit.headers && fastInit.headers.has('content-encoding')) {
+        bodyText = null;
+      } else if (isAsyncBodySource(fastInit.body)) {
+        bodyText = await fastInit.body.text();
+      } else {
+        bodyText = decodeBodyToTextSync(fastInit.body);
+      }
     } catch (preError) {
       var preMessage = preError && preError.message ? preError.message : String(preError);
       state.requests.errors += 1;
@@ -4530,10 +4656,47 @@ export function makeEarlyBridgeScript(options = {}) {
         state.settingsSavePending = null;
         state.lastSaveInvalidationReason = 'save-pre-error';
       }
-      if (state.settingsSaveSeq === saveSeq) {
-        return runFallbackSettingsSave(input, init);
+      if (state.settingsSaveSeq === saveSeq && saveSeq >= state.settingsSaveLastDispatchedSeq) {
+        state.settingsSaveLastDispatchedSeq = saveSeq;
+        var preFallbackPromise = runFallbackSettingsSave(input, init);
+        trackDispatchedSaveSettlement(preFallbackPromise);
+        return preFallbackPromise;
       }
       throw preError;
+    }
+
+    var resolveSupersededSaveResponse = async function () {
+      var newerSettlementPromise = state.settingsSaveLastDispatchedSettlement;
+      if (newerSettlementPromise) {
+        var newerSettlement = await newerSettlementPromise;
+        if (newerSettlement && newerSettlement.error) {
+          clearSettingsGetCache('save-network-error');
+          throw newerSettlement.error;
+        }
+        if (newerSettlement && !newerSettlement.ok) {
+          clearSettingsGetCache('save-superseded');
+          return makeJsonResponse(
+            { error: true, superseded: true },
+            { 'x-baibaoku-save-superseded': 'true' },
+            newerSettlement.status || 500
+          );
+        }
+      }
+      if (state.settingsGetCacheVersion === cacheVersionAtStart) {
+        clearSettingsGetCache('save-superseded');
+      }
+      return makeJsonResponse(
+        { result: 'ok', skipped: true },
+        {
+          'x-baibaoku-save-skipped': 'true',
+          'x-baibaoku-save-superseded': 'true',
+        },
+        200
+      );
+    };
+
+    if (saveSeq < state.settingsSaveLastDispatchedSeq) {
+      return resolveSupersededSaveResponse();
     }
 
     if (
@@ -4541,13 +4704,16 @@ export function makeEarlyBridgeScript(options = {}) {
       && state.settingsSavePending
       && state.settingsSavePending.bodyText === bodyText
       && state.settingsSavePending.outcomePromise
+      && saveSeq > state.settingsSavePending.latestSaveSeq
+      && (!state.settingsSavePending.dispatched || state.settingsSavePending.latestSaveSeq === saveSeq - 1)
     ) {
       var coalescedEntry = state.settingsSavePending;
       state.requests.frontendCache += 1;
       state.requests.saveFrontendCache += 1;
       coalescedEntry.followerCount += 1;
-      if (saveSeq > coalescedEntry.latestSaveSeq) {
-        coalescedEntry.latestSaveSeq = saveSeq;
+      coalescedEntry.latestSaveSeq = saveSeq;
+      if (coalescedEntry.dispatched && saveSeq > state.settingsSaveLastDispatchedSeq) {
+        state.settingsSaveLastDispatchedSeq = saveSeq;
       }
       var sharedOutcome = await coalescedEntry.outcomePromise;
       if (sharedOutcome && sharedOutcome.snapshot) {
@@ -4564,12 +4730,20 @@ export function makeEarlyBridgeScript(options = {}) {
         bodyText: bodyText,
         latestSaveSeq: saveSeq,
         followerCount: 0,
+        dispatched: false,
         outcomePromise: null,
       };
-      if (!state.settingsSavePending || saveSeq >= state.settingsSavePending.latestSaveSeq) {
+      if (
+        saveSeq >= state.settingsSaveLastDispatchedSeq
+        && (!state.settingsSavePending || saveSeq >= state.settingsSavePending.latestSaveSeq)
+      ) {
         state.settingsSavePending = pendingEntry;
       }
-    } else if (state.settingsSavePending && saveSeq >= state.settingsSavePending.latestSaveSeq) {
+    } else if (
+      saveSeq >= state.settingsSaveLastDispatchedSeq
+      && state.settingsSavePending
+      && saveSeq >= state.settingsSavePending.latestSaveSeq
+    ) {
       state.settingsSavePending = null;
     }
 
@@ -4592,34 +4766,92 @@ export function makeEarlyBridgeScript(options = {}) {
       return { response: response, snapshot: null };
     };
 
+    // Enqueue onto the FIFO pre-dispatch gate synchronously before yielding for
+    // async gzip compression so overlapping CompressionStream tasks never invert
+    // network dispatch order; release immediately once rawFetch is invoked so
+    // in-flight HTTP responses do not block subsequent dispatches.
+    var prevDispatchReady = state.settingsSaveDispatchQueue || Promise.resolve();
+    var releaseDispatchSlot;
+    var currentDispatchSlot = new Promise(function (resolve) {
+      releaseDispatchSlot = resolve;
+    });
+    var slotReleased = false;
+    var finishDispatchSlot = function () {
+      if (!slotReleased) {
+        slotReleased = true;
+        releaseDispatchSlot();
+      }
+    };
+    var nextDispatchTail = prevDispatchReady.then(function () {
+      return currentDispatchSlot;
+    });
+    state.settingsSaveDispatchQueue = nextDispatchTail;
+    nextDispatchTail.then(function () {
+      if (state.settingsSaveDispatchQueue === nextDispatchTail) {
+        state.settingsSaveDispatchQueue = null;
+      }
+    });
+
     var executeLeaderSave = async function () {
       var preparedInit;
       try {
-        preparedInit = await gzipFastSaveInit(fastInit);
+        var preparedPromise = gzipFastSaveInit(fastInit, bodyText);
+        var readyResults = await Promise.all([preparedPromise, prevDispatchReady]);
+        preparedInit = readyResults[0];
       } catch (prepError) {
+        await prevDispatchReady;
         var prepMessage = prepError && prepError.message ? prepError.message : String(prepError);
         state.requests.errors += 1;
         state.lastError = prepMessage;
-        if (state.settingsSaveSeq === getEffectiveSeq()) {
-          return finalizeResponse(await runFallbackSettingsSave(input, init));
+        var prepEffectiveSeq = getEffectiveSeq();
+        if (state.settingsSaveSeq === prepEffectiveSeq && prepEffectiveSeq >= state.settingsSaveLastDispatchedSeq) {
+          state.settingsSaveLastDispatchedSeq = prepEffectiveSeq;
+          if (pendingEntry) pendingEntry.dispatched = true;
+          var prepFallbackPromise = runFallbackSettingsSave(input, init);
+          trackDispatchedSaveSettlement(prepFallbackPromise);
+          finishDispatchSlot();
+          return finalizeResponse(await prepFallbackPromise);
         }
+        finishDispatchSlot();
         throw prepError;
       }
 
+      var dispatchSeq = getEffectiveSeq();
+      if (dispatchSeq < state.settingsSaveLastDispatchedSeq) {
+        finishDispatchSlot();
+        return finalizeResponse(await resolveSupersededSaveResponse());
+      }
+
+      state.settingsSaveLastDispatchedSeq = dispatchSeq;
+      if (pendingEntry) pendingEntry.dispatched = true;
+      var dispatchHeaders = new Headers((preparedInit && preparedInit.headers) || undefined);
+      dispatchHeaders.set('x-baibaoku-save-seq', state.settingsSaveClientEpoch + ':' + String(dispatchSeq));
+      var dispatchInit = Object.assign({}, preparedInit, { headers: dispatchHeaders });
+
       var saveResponse;
       try {
-        saveResponse = await rawFetch(route.fastPath, preparedInit);
+        var saveFetchPromise = rawFetch(route.fastPath, dispatchInit);
+        trackDispatchedSaveSettlement(saveFetchPromise);
+        finishDispatchSlot();
+        saveResponse = await saveFetchPromise;
       } catch (networkError) {
+        finishDispatchSlot();
         var netMessage = networkError && networkError.message ? networkError.message : String(networkError);
         state.requests.errors += 1;
         state.lastError = netMessage;
         state.lastSaveCacheError = netMessage;
         clearSettingsGetCache('save-network-error');
         throw networkError;
+      } finally {
+        finishDispatchSlot();
       }
 
       if (saveResponse && saveResponse.ok) {
-        if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
+        if (saveResponse.headers.get('x-baibaoku-save-superseded') === 'true') {
+          if (state.settingsGetCacheVersion === cacheVersionAtStart) {
+            clearSettingsGetCache('save-superseded');
+          }
+        } else if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
           clearSettingsGetCache('save');
         }
         return finalizeResponse(saveResponse);
@@ -4627,8 +4859,12 @@ export function makeEarlyBridgeScript(options = {}) {
 
       var status = saveResponse ? saveResponse.status : 0;
       if (isRouteUnavailableSaveStatus(status)) {
-        if (state.settingsSaveSeq === getEffectiveSeq()) {
-          return finalizeResponse(await runFallbackSettingsSave(input, init));
+        var postStatusSeq = getEffectiveSeq();
+        if (state.settingsSaveSeq === postStatusSeq && postStatusSeq >= state.settingsSaveLastDispatchedSeq) {
+          state.settingsSaveLastDispatchedSeq = postStatusSeq;
+          var unmountedFallbackPromise = runFallbackSettingsSave(input, init);
+          trackDispatchedSaveSettlement(unmountedFallbackPromise);
+          return finalizeResponse(await unmountedFallbackPromise);
         }
         clearSettingsGetCache('save-superseded');
         return finalizeResponse(saveResponse);
@@ -4638,7 +4874,10 @@ export function makeEarlyBridgeScript(options = {}) {
       return finalizeResponse(saveResponse);
     };
 
-    var outcomePromise = executeLeaderSave().finally(detachPendingEntry);
+    var outcomePromise = executeLeaderSave().finally(function () {
+      finishDispatchSlot();
+      detachPendingEntry();
+    });
     if (pendingEntry) {
       pendingEntry.outcomePromise = outcomePromise;
     }
@@ -4651,17 +4890,25 @@ export function makeEarlyBridgeScript(options = {}) {
     var url = toUrl(input);
     var method = getMethod(input, init);
     var route = shouldIntercept(url, method);
+    var directSaveSeq = 0;
 
     if (route && route.kind === 'save') {
       if (state.settingsAccelerationEnabled !== false) {
         return handleFastSettingsSave(route, input, init, method);
       }
-      state.settingsSaveSeq = (Number(state.settingsSaveSeq) || 0) + 1;
+      directSaveSeq = (state.settingsSaveSeq = (Number(state.settingsSaveSeq) || 0) + 1);
       state.settingsSavePending = null;
+      if (directSaveSeq > state.settingsSaveLastDispatchedSeq) {
+        state.settingsSaveLastDispatchedSeq = directSaveSeq;
+      }
     }
 
     if (!await shouldUseFastRoute(route, input, init)) {
-      var originalResponse = await rawFetch(input, init);
+      var originalFetchPromise = rawFetch(input, init);
+      if (directSaveSeq > 0 && directSaveSeq >= state.settingsSaveLastDispatchedSeq) {
+        trackDispatchedSaveSettlement(originalFetchPromise);
+      }
+      var originalResponse = await originalFetchPromise;
       if (originalResponse && originalResponse.ok && url && url.origin === location.origin && method === 'GET' && url.pathname === '/csrf-token') {
         void handleCsrfTokenResponse(originalResponse.clone()).catch(function (error) {
           state.requests.errors += 1;
@@ -4865,6 +5112,7 @@ export function closeStEndpointCaches() {
     settingsUpdateLocks.clear();
     settingsFileCaches.clear();
     settingsSaveLocks.clear();
+    settingsClientSaveSeqs.clear();
     settingsResponseCaches.clear();
     lazyThemeToolkitDirCache.clear();
     for (const scheduler of settingsBackupSchedulers.values()) {
@@ -5123,6 +5371,9 @@ export function registerStEndpoints(router, manager) {
             setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', Date.now() - startedAt);
             if (result.skipped) {
                 setSafeHeader(res, 'X-Baibaoku-Save-Skipped', true);
+            }
+            if (result.superseded) {
+                setSafeHeader(res, 'X-Baibaoku-Save-Superseded', true);
             }
             res.json(result);
             scheduleSettingsResponseWarmup(req, userHandle, result.skipped ? 'fast-save-skipped' : 'fast-save');
