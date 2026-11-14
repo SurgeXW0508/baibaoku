@@ -2,19 +2,47 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import { register } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
 const stRootFromSymlink = path.resolve(pluginRoot, '..', '..');
+const stSiblingRoot = path.resolve(pluginRoot, '..', 'SillyTavern');
 const stRepoRoot = fs.existsSync(path.join(stRootFromSymlink, '.git'))
     ? stRootFromSymlink
-    : path.dirname(fs.realpathSync(path.join(stRootFromSymlink, 'public')));
+    : (fs.existsSync(path.join(stRootFromSymlink, 'public'))
+        ? path.dirname(fs.realpathSync(path.join(stRootFromSymlink, 'public')))
+        : stSiblingRoot);
+
+if (!fs.existsSync(path.join(stRootFromSymlink, 'src', 'util.js')) && fs.existsSync(path.join(stRepoRoot, 'src', 'util.js'))) {
+    const pluginPrefix = pathToFileURL(`${pluginRoot}${path.sep}`).href;
+    const virtualHostRoot = stRootFromSymlink;
+    const loaderSource = `
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+const pluginPrefix = ${JSON.stringify(pluginPrefix)};
+const virtualHostRoot = ${JSON.stringify(virtualHostRoot)};
+const stRepoRoot = ${JSON.stringify(stRepoRoot)};
+export async function resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && context.parentURL && context.parentURL.startsWith(pluginPrefix)) {
+        const resolved = path.resolve(path.dirname(fileURLToPath(context.parentURL)), specifier);
+        if (resolved.startsWith(virtualHostRoot + path.sep + 'src' + path.sep)
+            || resolved.startsWith(virtualHostRoot + path.sep + 'public' + path.sep)) {
+            const rel = path.relative(virtualHostRoot, resolved);
+            return nextResolve(pathToFileURL(path.join(stRepoRoot, rel)).href, context);
+        }
+    }
+    return nextResolve(specifier, context);
+}
+`;
+    register(`data:text/javascript,${encodeURIComponent(loaderSource)}`);
+}
 
 const tmpRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'baibaoku-perf-own-')));
 const gitConfigFile = path.join(tmpRoot, 'gitconfig');
@@ -54,6 +82,7 @@ const { sync: writeFileAtomicSync } = await import('write-file-atomic');
 const { write: writeCharacterPng } = await import('../../../src/character-card-parser.js');
 const { DatabaseManager } = await import('../src/database.js');
 const {
+    FAST_CHARACTER_CACHE_SCHEMA,
     SETTINGS_CACHE_INVALIDATE_PREFIXES,
     SETTINGS_CACHE_READONLY_PATHS,
     closeStEndpointCaches,
@@ -1868,5 +1897,533 @@ test('WP-3 Chain 3: makeEarlyBridgeScript preserves native MutationObserver, exp
         dbManager.closeAll();
     }
 });
+
+test('WP-2 Round 2: Early Bridge fast-save monotonic settingsSaveSeq prevents post-dispatch overwrite on network drop / 5xx and blocks superseded 404 fallback', async () => {
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp2-r2-settings-user');
+        const settingsPath = path.join(user.directories.root, 'settings.json');
+        fs.writeFileSync(settingsPath, JSON.stringify({ active_preset: 'Initial', temp: 0.5 }, null, 4));
+
+        let fastGetCalls = 0;
+        let fastSaveCalls = 0;
+        let nativeSaveCalls = 0;
+        let fastSaveResponder = null;
+
+        const windowObj = {
+            location: new URL('http://127.0.0.1:8000/'),
+            Response,
+            Headers,
+            Request,
+            Blob,
+            URL,
+            URLSearchParams,
+            TextEncoder,
+            TextDecoder,
+            Promise,
+            setTimeout,
+            clearTimeout,
+            document: {
+                readyState: 'complete',
+                body: {},
+                addEventListener: () => {},
+                documentElement: null,
+            },
+            fetch: async (input, init = {}) => {
+                const url = typeof input === 'string' ? input : input.url;
+                const pathname = new URL(url, 'http://127.0.0.1:8000').pathname;
+                const rawBody = typeof init.body === 'string'
+                    ? init.body
+                    : (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
+                        ? new TextDecoder().decode(init.body)
+                        : '{}');
+
+                if (pathname === '/api/plugins/baibaoku/v1/settings/fast-get') {
+                    fastGetCalls += 1;
+                    const text = fs.readFileSync(settingsPath, 'utf8');
+                    return new Response(JSON.stringify({ settings: text, themes: [] }), {
+                        status: 200,
+                        headers: { 'content-type': 'application/json' },
+                    });
+                }
+
+                if (pathname === '/api/plugins/baibaoku/v1/settings/fast-save') {
+                    fastSaveCalls += 1;
+                    if (fastSaveResponder) {
+                        return await fastSaveResponder(rawBody);
+                    }
+                    const res = await harness.invoke('POST', '/v1/settings/fast-save', {
+                        user,
+                        body: JSON.parse(rawBody),
+                    });
+                    const headers = { 'content-type': 'application/json' };
+                    if (res.headers.get('x-baibaoku-save-skipped')) {
+                        headers['x-baibaoku-save-skipped'] = res.headers.get('x-baibaoku-save-skipped');
+                    }
+                    return new Response(JSON.stringify(res.body), { status: res.status, headers });
+                }
+
+                if (pathname === '/api/settings/save') {
+                    nativeSaveCalls += 1;
+                    writeFileAtomicSync(settingsPath, JSON.stringify(JSON.parse(rawBody), null, 4), 'utf8');
+                    return new Response(JSON.stringify({ result: 'ok' }), {
+                        status: 200,
+                        headers: { 'content-type': 'application/json' },
+                    });
+                }
+
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                });
+            },
+        };
+        windowObj.window = windowObj;
+        windowObj.globalThis = windowObj;
+
+        const script = makeEarlyBridgeScript({
+            settingsAccelerationEnabled: true,
+            lazyThemeLoadingEnabled: false,
+            characterListAccelerationEnabled: false,
+            recentChatListAccelerationEnabled: false,
+            tokenizerBulkCountEnabled: false,
+            extensionManifestBundleEnabled: false,
+            versionAccelerationEnabled: false,
+        });
+        vm.runInNewContext(script, windowObj);
+        const bridge = windowObj.__baibaokuEarlyBridge;
+        assert.equal(bridge.settingsSaveSeq, 0);
+
+        // Prime client settingsGetCache
+        const initialGet = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(JSON.parse(initialGet.settings).active_preset, 'Initial');
+        assert.equal(fastGetCalls, 1);
+
+        // 1a. Exact External Review P1: Save A writes to server, Save B writes & resolves 200, then Save A HTTP response drops!
+        let rejectHeldSaveA;
+        let markSaveAWritten;
+        const saveAWrittenPromise = new Promise(resolve => { markSaveAWritten = resolve; });
+        const payloadA = JSON.stringify({ active_preset: 'PresetA', temp: 0.7 });
+        const payloadB = JSON.stringify({ active_preset: 'PresetB', temp: 1.1 });
+
+        fastSaveResponder = async (rawBody) => {
+            const parsed = JSON.parse(rawBody);
+            const res = await harness.invoke('POST', '/v1/settings/fast-save', { user, body: parsed });
+            if (parsed.active_preset === 'PresetA') {
+                markSaveAWritten();
+                return await new Promise((_resolve, reject) => {
+                    rejectHeldSaveA = reject;
+                });
+            }
+            return new Response(JSON.stringify(res.body), {
+                status: res.status,
+                headers: { 'content-type': 'application/json' },
+            });
+        };
+
+        const saveAPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadA });
+        await saveAWrittenPromise;
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetA');
+
+        const saveBRes = await windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadB });
+        assert.equal(saveBRes.ok, true);
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetB');
+
+        // Re-populate client settingsGetCache with B before A's network connection drops
+        const cachedBGet = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(JSON.parse(cachedBGet.settings).active_preset, 'PresetB');
+        assert.equal(fastGetCalls, 2);
+        assert.ok(bridge.settingsGetCache, 'settingsGetCache should hold PresetB prior to A network drop');
+
+        // Drop A's HTTP connection after server write!
+        rejectHeldSaveA(new TypeError('Failed to fetch'));
+        await assert.rejects(saveAPromise, err => err instanceof TypeError && err.message === 'Failed to fetch');
+
+        assert.equal(nativeSaveCalls, 0, 'post-dispatch network failure must NEVER fall back to /api/settings/save');
+        assert.equal(
+            JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset,
+            'PresetB',
+            'persisted settings.json must remain PresetB, never overwritten back to PresetA',
+        );
+        assert.equal(bridge.settingsGetCache, null, 'post-dispatch network failure must invalidate settingsGetCache');
+        assert.equal(bridge.lastInvalidationReason, 'save-network-error');
+
+        const freshAfterDrop = await (await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' })).json();
+        assert.equal(fastGetCalls, 3, 'subsequent settings/get must refetch fresh PresetB after invalidation');
+        assert.equal(JSON.parse(freshAfterDrop.settings).active_preset, 'PresetB');
+
+        // 1b. Exact External Review P1 (HTTP 500 variant + coalesced followers):
+        // Save C (2 coalesced callers) writes C on server, Save D writes D & succeeds, then Save C returns 500 Internal Server Error!
+        let resolveHeldSaveC;
+        let markSaveCWritten;
+        const saveCWrittenPromise = new Promise(resolve => { markSaveCWritten = resolve; });
+        const payloadC = JSON.stringify({ active_preset: 'PresetC', temp: 0.3 });
+        const payloadD = JSON.stringify({ active_preset: 'PresetD', temp: 0.9 });
+
+        fastSaveResponder = async (rawBody) => {
+            const parsed = JSON.parse(rawBody);
+            const res = await harness.invoke('POST', '/v1/settings/fast-save', { user, body: parsed });
+            if (parsed.active_preset === 'PresetC') {
+                markSaveCWritten();
+                return await new Promise((resolve) => {
+                    resolveHeldSaveC = resolve;
+                });
+            }
+            return new Response(JSON.stringify(res.body), {
+                status: res.status,
+                headers: { 'content-type': 'application/json' },
+            });
+        };
+
+        const saveCPromise1 = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadC });
+        const saveCPromise2 = windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadC });
+        await saveCWrittenPromise;
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetC');
+
+        const saveDRes = await windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadD });
+        assert.equal(saveDRes.ok, true);
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetD');
+
+        await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' });
+        assert.ok(bridge.settingsGetCache);
+
+        resolveHeldSaveC(new Response('Internal Server Error', {
+            status: 500,
+            statusText: 'Internal Server Error',
+            headers: { 'content-type': 'text/plain' },
+        }));
+        const [saveCRes1, saveCRes2] = await Promise.all([saveCPromise1, saveCPromise2]);
+        assert.equal(saveCRes1.status, 500);
+        assert.equal(saveCRes2.status, 500);
+        assert.equal(await saveCRes1.text(), 'Internal Server Error');
+        assert.equal(await saveCRes2.text(), 'Internal Server Error');
+        assert.equal(nativeSaveCalls, 0, 'HTTP 500 on fast-save must NEVER fall back to /api/settings/save');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetD');
+        assert.equal(bridge.settingsGetCache, null, 'HTTP 500 must invalidate settingsGetCache');
+        assert.equal(bridge.lastInvalidationReason, 'save-error');
+
+        // Also verify non-route-missing statuses (400, 401, 403, 502, 503, 504) never call native save even when unsuperseded
+        for (const errStatus of [400, 401, 403, 502, 503, 504]) {
+            await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' });
+            assert.ok(bridge.settingsGetCache);
+            fastSaveResponder = async () => new Response(JSON.stringify({ error: errStatus }), {
+                status: errStatus,
+                headers: { 'content-type': 'application/json' },
+            });
+            const errRes = await windowObj.fetch('/api/settings/save', {
+                method: 'POST',
+                body: JSON.stringify({ active_preset: `ShouldNotFallback_${errStatus}` }),
+            });
+            assert.equal(errRes.status, errStatus);
+            assert.equal(nativeSaveCalls, 0, `HTTP ${errStatus} must never fall back to /api/settings/save`);
+            assert.equal(bridge.settingsGetCache, null, `HTTP ${errStatus} must invalidate settingsGetCache`);
+        }
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetD');
+
+        // 2a. Route-unmounted 404 fallback when NO newer save started (both single and coalesced identical saves)
+        await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' });
+        assert.ok(bridge.settingsGetCache);
+
+        fastSaveResponder = async () => new Response('Not Found', { status: 404, statusText: 'Not Found' });
+        const payloadFallbackSingle = JSON.stringify({ active_preset: 'UnmountedFallbackSingle', temp: 0.6 });
+        const single404FallbackRes = await windowObj.fetch('/api/settings/save', {
+            method: 'POST',
+            body: payloadFallbackSingle,
+        });
+        assert.equal(single404FallbackRes.status, 200);
+        assert.equal(nativeSaveCalls, 1, 'unsuperseded 404 must fall back once to /api/settings/save');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'UnmountedFallbackSingle');
+        assert.equal(bridge.settingsGetCache, null, 'successful fallback save must invalidate settingsGetCache');
+
+        // Coalesced identical saves hitting 404 must fall back to /api/settings/save ONLY ONCE and return unread 200 to both callers
+        const payloadFallbackCoalesced = JSON.stringify({ active_preset: 'UnmountedFallbackCoalesced', temp: 0.65 });
+        const [coal404Res1, coal404Res2] = await Promise.all([
+            windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadFallbackCoalesced }),
+            windowObj.fetch('/api/settings/save', { method: 'POST', body: payloadFallbackCoalesced }),
+        ]);
+        assert.equal(coal404Res1.status, 200);
+        assert.equal(coal404Res2.status, 200);
+        assert.deepEqual(await coal404Res1.json(), { result: 'ok' });
+        assert.deepEqual(await coal404Res2.json(), { result: 'ok' });
+        assert.equal(nativeSaveCalls, 2, 'coalesced identical saves hitting 404 must execute native fallback only once');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'UnmountedFallbackCoalesced');
+
+        // 2b. Superseded 404: Save E is in flight, Save F starts (advancing settingsSaveSeq) and writes PresetF, then E returns 404!
+        let resolveHeld404E;
+        let markSaveEDispatched;
+        const saveEDispatchedPromise = new Promise(resolve => { markSaveEDispatched = resolve; });
+        fastSaveResponder = async (rawBody) => {
+            const parsed = JSON.parse(rawBody);
+            if (parsed.active_preset === 'PresetE_Stale404') {
+                markSaveEDispatched();
+                return await new Promise((resolve) => {
+                    resolveHeld404E = resolve;
+                });
+            }
+            const res = await harness.invoke('POST', '/v1/settings/fast-save', { user, body: parsed });
+            return new Response(JSON.stringify(res.body), {
+                status: res.status,
+                headers: { 'content-type': 'application/json' },
+            });
+        };
+
+        const stale404Promise = windowObj.fetch('/api/settings/save', {
+            method: 'POST',
+            body: JSON.stringify({ active_preset: 'PresetE_Stale404' }),
+        });
+        await saveEDispatchedPromise;
+
+        const newerFRes = await windowObj.fetch('/api/settings/save', {
+            method: 'POST',
+            body: JSON.stringify({ active_preset: 'PresetF_Newer' }),
+        });
+        assert.equal(newerFRes.ok, true);
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetF_Newer');
+
+        await windowObj.fetch('/api/settings/get', { method: 'POST', body: '{}' });
+        assert.ok(bridge.settingsGetCache);
+
+        const nativeCallsBeforeStale404 = nativeSaveCalls;
+        resolveHeld404E(new Response('Not Found', { status: 404, statusText: 'Not Found' }));
+        const stale404Res = await stale404Promise;
+        assert.equal(stale404Res.status, 404, 'superseded 404 must return 404 without calling native fallback');
+        assert.equal(nativeSaveCalls, nativeCallsBeforeStale404, 'superseded 404 must NEVER call /api/settings/save');
+        assert.equal(
+            JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset,
+            'PresetF_Newer',
+            'superseded 404 must not clobber PresetF_Newer',
+        );
+        assert.equal(bridge.settingsGetCache, null);
+        assert.equal(bridge.lastInvalidationReason, 'save-superseded');
+
+        // 2c. Pre-dispatch body read failure: superseded pre-dispatch throw must NOT call /api/settings/save
+        let rejectBrokenBlob;
+        const brokenSlowBlob = Object.create(Blob.prototype);
+        brokenSlowBlob.text = () => new Promise((_resolve, reject) => {
+            rejectBrokenBlob = reject;
+        });
+        const fastSaveCallsBeforePreErr = fastSaveCalls;
+        const preErrPromise = windowObj.fetch('/api/settings/save', { method: 'POST', body: brokenSlowBlob });
+
+        // Newer save G arrives and succeeds before brokenSlowBlob.text() rejects
+        const newerGRes = await windowObj.fetch('/api/settings/save', {
+            method: 'POST',
+            body: JSON.stringify({ active_preset: 'PresetG_AfterPreError' }),
+        });
+        assert.equal(newerGRes.ok, true);
+        assert.equal(fastSaveCalls, fastSaveCallsBeforePreErr + 1, 'pre-dispatch error must not have dispatched fast-save');
+
+        const nativeCallsBeforePreErr = nativeSaveCalls;
+        rejectBrokenBlob(new Error('Blob read failed'));
+        await assert.rejects(preErrPromise, /Blob read failed/);
+        assert.equal(nativeSaveCalls, nativeCallsBeforePreErr, 'superseded pre-dispatch error must not call native fallback');
+        assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, 'PresetG_AfterPreError');
+
+        // 2d. Verify 405 and 501 also act as definite pre-write route-unavailable statuses when unsuperseded
+        for (const unmountedStatus of [405, 501]) {
+            fastSaveResponder = async () => new Response('Route Unavailable', { status: unmountedStatus });
+            const prevNative = nativeSaveCalls;
+            const fallbackRes = await windowObj.fetch('/api/settings/save', {
+                method: 'POST',
+                body: JSON.stringify({ active_preset: `Fallback_${unmountedStatus}` }),
+            });
+            assert.equal(fallbackRes.status, 200);
+            assert.equal(nativeSaveCalls, prevNative + 1);
+            assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).active_preset, `Fallback_${unmountedStatus}`);
+        }
+    } finally {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
+test('WP-4 Round 2: Legacy V2 character cards without data.name/data.tags match SillyTavern readFromV2 + toShallow parity and rebuild schema=2 SQLite cache', async () => {
+    assert.equal(FAST_CHARACTER_CACHE_SCHEMA, 3, 'FAST_CHARACTER_CACHE_SCHEMA must be bumped to 3');
+
+    // Load SillyTavern's real pure `readFromV2`, `toShallow`, and `calculateDataSize` functions directly from characters.js
+    const lodashMod = await import(pathToFileURL(path.join(stRepoRoot, 'node_modules/lodash/lodash.js')).href);
+    const _ = lodashMod.default;
+    const { humanizedDateTime } = await import(pathToFileURL(path.join(stRepoRoot, 'src/util.js')).href);
+    const stCharactersSource = fs.readFileSync(path.join(stRepoRoot, 'src/endpoints/characters.js'), 'utf8');
+    const calcMatch = stCharactersSource.match(/const calculateDataSize = \(data\) => \{[\s\S]*?\n\};/);
+    const shallowMatch = stCharactersSource.match(/const toShallow = \(character\) => \{[\s\S]*?\n\};/);
+    const readFromV2Match = stCharactersSource.match(/function readFromV2\(char\) \{[\s\S]*?\n\}/);
+    assert.ok(calcMatch && shallowMatch && readFromV2Match, 'expected ST characters.js helpers to be extractable');
+
+    const buildStHelpers = new Function(
+        '_',
+        'humanizedDateTime',
+        'console',
+        `${calcMatch[0]}\n${shallowMatch[0]}\n${readFromV2Match[0]}\nreturn { stReadFromV2: readFromV2, stToShallow: toShallow, stCalculateDataSize: calculateDataSize };`,
+    );
+    const { stReadFromV2, stToShallow, stCalculateDataSize } = buildStHelpers(
+        _,
+        humanizedDateTime,
+        { warn: () => {}, info: () => {}, error: () => {} },
+    );
+
+    const runStNativeShallow = (rawCard, filename, stat) => {
+        const cloned = structuredClone(rawCard);
+        const v2Obj = stReadFromV2(cloned);
+        v2Obj.avatar = filename;
+        v2Obj.date_added = stat.ctimeMs;
+        v2Obj.create_date = v2Obj.create_date || new Date(Math.round(stat.ctimeMs)).toISOString();
+        v2Obj.chat_size = 0;
+        v2Obj.date_last_chat = 0;
+        v2Obj.data_size = stCalculateDataSize(v2Obj?.data);
+        if (!v2Obj.name) {
+            return null;
+        }
+        const shallow = stToShallow(v2Obj);
+        // ST's readFromV2 omits `return` after `char.fav = false` when `extensions.fav` is undefined,
+        // leaving `fav: undefined` in JS memory (which omits `fav` in JSON); BaiBaoKu normalizes `fav` to boolean.
+        shallow.fav = shallow.fav === true || shallow.fav === 'true';
+        shallow.data.extensions.fav = shallow.data.extensions.fav === true || shallow.data.extensions.fav === 'true';
+        return shallow;
+    };
+
+    const dbManager = new DatabaseManager();
+    try {
+        closeStEndpointCaches();
+        const harness = createEndpointHarness(dbManager);
+        const user = createUserContext('wp4-r2-legacy-v2-user');
+        const { characters: charactersDir, chats: chatsDir } = user.directories;
+        const fakeStat = { ctimeMs: 1_720_000_000_000, mtimeMs: 1_720_000_000_000, size: 1024 };
+
+        // 1. Legacy V2 card with root name/tags and V2 `data` missing `data.name` and `data.tags`
+        const legacyRootAliceCard = {
+            name: 'LegacyRootAlice',
+            tags: ['classic', 'v1-root'],
+            chat: 'LegacyRootAlice - 2026-01-01@00h00m00s000ms',
+            create_date: '2026-01-01T00:00:00.000Z',
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: {
+                description: 'Has V2 data without data.name or data.tags',
+            },
+        };
+        const bbkAliceShallow = await formatShallowCharacter(
+            'LegacyRootAlice.png',
+            fakeStat,
+            JSON.stringify(legacyRootAliceCard),
+            chatsDir,
+            null,
+        );
+        const stAliceShallow = runStNativeShallow(legacyRootAliceCard, 'LegacyRootAlice.png', fakeStat);
+        assert.ok(bbkAliceShallow, 'formatShallowCharacter must preserve legacy V2 card with root name');
+        assert.equal(bbkAliceShallow.name, 'LegacyRootAlice');
+        assert.deepEqual(bbkAliceShallow.tags, ['classic', 'v1-root']);
+        assert.equal(bbkAliceShallow.fav, false);
+        assert.equal(bbkAliceShallow.data.name, '');
+        assert.deepEqual(bbkAliceShallow.data.tags, []);
+        assert.equal(bbkAliceShallow.data.extensions.fav, false);
+        const { _chatStats: _ignoredStats1, ...bbkAlicePublic } = bbkAliceShallow;
+        assert.deepEqual(bbkAlicePublic, stAliceShallow, 'BaiBaoKu shallow output must match ST readFromV2 + toShallow field-for-field');
+
+        // 2. V2 card missing `data` object entirely (`isV2 && !hasV2Data`) with root `fav: true`
+        const rootOnlyV2Card = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            name: 'RootOnlyV2',
+            fav: true,
+            tags: ['solo'],
+            chat: 'RootOnlyV2 - fixed',
+            create_date: '2026-01-02T00:00:00.000Z',
+        };
+        const bbkRootOnlyShallow = await formatShallowCharacter(
+            'RootOnlyV2.png',
+            fakeStat,
+            JSON.stringify(rootOnlyV2Card),
+            chatsDir,
+            null,
+        );
+        const stRootOnlyShallow = runStNativeShallow(rootOnlyV2Card, 'RootOnlyV2.png', fakeStat);
+        assert.ok(bbkRootOnlyShallow);
+        const { _chatStats: _ignoredStats2, ...bbkRootOnlyPublic } = bbkRootOnlyShallow;
+        assert.deepEqual(bbkRootOnlyPublic, stRootOnlyShallow, 'isV2 && !hasV2Data shallow output must match ST readFromV2 + toShallow');
+
+        // 3. Card with explicit `data.name: ""` MUST still return null even if root `name` is non-empty
+        const explicitEmptyDataNameCard = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            name: 'IgnoredRootBecauseDataNameDefinedAsEmpty',
+            data: {
+                name: '',
+                description: 'Explicit empty V2 name',
+            },
+        };
+        const explicitEmptyResult = await formatShallowCharacter(
+            'ExplicitEmpty.png',
+            fakeStat,
+            JSON.stringify(explicitEmptyDataNameCard),
+            chatsDir,
+            null,
+        );
+        assert.equal(explicitEmptyResult, null, 'explicit data.name="" must not fall back to root name');
+        assert.equal(runStNativeShallow(explicitEmptyDataNameCard, 'ExplicitEmpty.png', fakeStat), null);
+
+        // 4. End-to-end /v1/characters/fast-all + persisted schema=2 SQLite cache invalidation and rebuild under schema=3
+        writeV2CardPng(path.join(charactersDir, 'LegacyRootAlice.png'), legacyRootAliceCard);
+        writeV2CardPng(path.join(charactersDir, 'ExplicitEmpty.png'), explicitEmptyDataNameCard);
+
+        const aliceFileStat = fs.statSync(path.join(charactersDir, 'LegacyRootAlice.png'));
+        const reqCtx = { user };
+        await dbManager.openForRequest(reqCtx, 'baibaoku.internal', {
+            displayName: '柏宝库内部缓存',
+            version: 1,
+        });
+        // Seed stale schema=2 entry with wrong/stale name & tags (and matching mtime/size so ONLY schema=3 bump forces rebuild!)
+        await dbManager.set(reqCtx, 'baibaoku.internal', 'character-fast-all', 'LegacyRootAlice.png', {
+            schema: 2,
+            mtime: aliceFileStat.mtimeMs,
+            size: aliceFileStat.size,
+            data: {
+                shallow: true,
+                name: 'StaleSchema2Name',
+                avatar: 'LegacyRootAlice.png',
+                tags: [],
+                data: { name: 'StaleSchema2Name', tags: [], extensions: { fav: false, world: '' } },
+            },
+        });
+        await dbManager.set(reqCtx, 'baibaoku.internal', 'character-fast-all', 'GhostSchema2.png', {
+            schema: 2,
+            mtime: aliceFileStat.mtimeMs,
+            size: aliceFileStat.size,
+            data: {
+                shallow: true,
+                name: 'GhostSchema2',
+                avatar: 'GhostSchema2.png',
+            },
+        });
+        closeStEndpointCaches();
+
+        const fastAllRes = await harness.invoke('POST', '/v1/characters/fast-all', { user });
+        assert.equal(fastAllRes.status, 200);
+        assert.deepEqual(
+            fastAllRes.body.map(c => c.avatar),
+            ['LegacyRootAlice.png'],
+            'fast-all must include LegacyRootAlice.png and omit ExplicitEmpty.png & purged GhostSchema2.png',
+        );
+        assert.equal(fastAllRes.body[0].name, 'LegacyRootAlice', 'schema=2 entry must be invalidated and rebuilt');
+        assert.deepEqual(fastAllRes.body[0].tags, ['classic', 'v1-root']);
+        assert.equal(fastAllRes.body[0].data.name, '');
+        assert.deepEqual(fastAllRes.body[0].data.tags, []);
+
+        const persistedAlice = await dbManager.get(reqCtx, 'baibaoku.internal', 'character-fast-all', 'LegacyRootAlice.png');
+        assert.equal(persistedAlice.exists, true);
+        assert.equal(persistedAlice.value.schema, 3, 'rebuilt SQLite entry must be persisted with schema=3');
+        assert.equal(persistedAlice.value.data.name, 'LegacyRootAlice');
+
+        const persistedGhost = await dbManager.get(reqCtx, 'baibaoku.internal', 'character-fast-all', 'GhostSchema2.png');
+        assert.equal(persistedGhost.exists, false, 'stale schema=2 entry must be deleted from SQLite');
+    } finally {
+        closeStEndpointCaches();
+        dbManager.closeAll();
+    }
+});
+
 
 

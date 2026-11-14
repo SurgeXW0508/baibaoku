@@ -26,7 +26,7 @@ import { setSafeHeader } from './header-utils.js';
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
 const FAST_CHARACTER_CACHE_VERSION = 1;
-const FAST_CHARACTER_CACHE_SCHEMA = 2;
+export const FAST_CHARACTER_CACHE_SCHEMA = 3;
 const FAST_CHARACTER_CACHE_PAGE_SIZE = 1000;
 const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
 const SETTINGS_FAST_CONFIG_STORE = 'fast-config';
@@ -139,20 +139,22 @@ function humanizedDateTime(timestamp = Date.now()) {
     return `${dt.year}-${dt.month}-${dt.day}@${dt.hour}h${dt.minute}m${dt.second}s${dt.millisecond}ms`;
 }
 
-/**
- * Normalizes tags from V1/V2 char data structure, matching ST's V2 vs V1 precedence.
- */
-function extractTags(data, hasV2Data = false) {
-    let rawTags;
-    if (hasV2Data) {
-        rawTags = data?.data?.tags;
-    } else {
-        rawTags = data?.tags !== undefined ? data.tags : data?.data?.tags;
-    }
+function normalizeTagList(rawTags) {
     if (typeof rawTags === 'string') {
-        rawTags = rawTags.split(',').map(x => x.trim()).filter(x => x);
+        return rawTags.split(',').map(x => x.trim()).filter(x => x);
     }
     return Array.isArray(rawTags) ? rawTags : [];
+}
+
+/**
+ * Normalizes tags from V1/V2 char data structure, matching ST's `readFromV2` / `convertToV2` precedence.
+ */
+function extractTags(data, hasV2Data = false) {
+    if (hasV2Data) {
+        const rawTags = data?.data?.tags !== undefined ? data.data.tags : data?.tags;
+        return normalizeTagList(rawTags);
+    }
+    return normalizeTagList(data?.tags);
 }
 
 function normalizeCharacterFav(rawFav) {
@@ -324,11 +326,10 @@ export async function formatShallowCharacter(filename, stat, rawDataStr, chatsDi
     }
     const hasV2Data = isV2 && charData.data !== undefined;
 
-    const rawName = hasV2Data
-        ? (typeof charData.data?.name === 'string' ? charData.data.name : '')
-        : (typeof charData.name === 'string' && charData.name
-            ? charData.name
-            : (typeof charData.data?.name === 'string' ? charData.data.name : ''));
+    const candidateName = hasV2Data
+        ? (charData.data.name !== undefined ? charData.data.name : charData.name)
+        : charData.name;
+    const rawName = typeof candidateName === 'string' ? candidateName : '';
 
     if (!rawName || !rawName.trim()) {
         return null;
@@ -339,8 +340,9 @@ export async function formatShallowCharacter(filename, stat, rawDataStr, chatsDi
         ? (hasV2Data
             ? (charData.data?.extensions?.fav !== undefined ? charData.data.extensions.fav : false)
             : (charData.fav !== undefined ? charData.fav : false))
-        : (charData.fav ?? charData.data?.extensions?.fav ?? false);
+        : (charData.fav !== undefined ? charData.fav : false);
     const fav = normalizeCharacterFav(rawFav);
+    const extensionFav = hasV2Data ? fav : (isV2 ? false : fav);
 
     const tags = extractTags(charData, hasV2Data);
     const v2DataForSize = isV2
@@ -351,8 +353,10 @@ export async function formatShallowCharacter(filename, stat, rawDataStr, chatsDi
     // Get real chat statistics
     const chatStats = await calculateCharacterChatStats(chatsDir, filename, cachedChatStats);
 
-    const chatField = charData.chat ?? `${name} - ${humanizedDateTime()}`;
-    const createDate = charData.create_date || charData.data?.create_date || new Date(Math.round(stat.ctimeMs)).toISOString();
+    const chatField = (isV2 && !hasV2Data)
+        ? charData.chat
+        : (charData.chat ?? `${name} - ${humanizedDateTime()}`);
+    const createDate = charData.create_date || new Date(Math.round(stat.ctimeMs)).toISOString();
 
     return {
         shallow: true,
@@ -367,14 +371,14 @@ export async function formatShallowCharacter(filename, stat, rawDataStr, chatsDi
         data_size: dataSize,
         tags,
         data: {
-            name: hasV2Data ? (charData.data?.name ?? '') : (isV2 ? '' : name),
-            character_version: hasV2Data ? (charData.data?.character_version ?? '') : '',
-            creator: hasV2Data ? (charData.data?.creator ?? '') : (isV2 ? '' : (charData.creator || '')),
-            creator_notes: hasV2Data ? (charData.data?.creator_notes ?? '') : (isV2 ? '' : (charData.creatorcomment || '')),
-            tags: hasV2Data ? extractTags(charData, true) : (isV2 ? [] : tags),
+            name: hasV2Data ? (charData.data.name !== undefined ? charData.data.name : '') : (isV2 ? '' : name),
+            character_version: hasV2Data ? (charData.data.character_version !== undefined ? charData.data.character_version : '') : '',
+            creator: hasV2Data ? (charData.data.creator !== undefined ? charData.data.creator : '') : (isV2 ? '' : (charData.creator || '')),
+            creator_notes: hasV2Data ? (charData.data.creator_notes !== undefined ? charData.data.creator_notes : '') : (isV2 ? '' : (charData.creatorcomment || '')),
+            tags: hasV2Data ? (charData.data.tags !== undefined ? normalizeTagList(charData.data.tags) : []) : (isV2 ? [] : tags),
             extensions: {
-                fav,
-                world: hasV2Data ? (charData.data?.extensions?.world ?? '') : '',
+                fav: extensionFav,
+                world: hasV2Data ? (charData.data.extensions?.world !== undefined ? charData.data.extensions.world : '') : '',
             },
         },
         // Internal: store chat stats for future incremental updates
@@ -3541,6 +3545,7 @@ export function makeEarlyBridgeScript(options = {}) {
   state.settingsGetCacheVersion = typeof state.settingsGetCacheVersion === 'number' ? state.settingsGetCacheVersion : 0;
   state.settingsSaveCache = null;
   state.settingsSavePending = null;
+  state.settingsSaveSeq = Number(state.settingsSaveSeq) || 0;
   state.settingsRequestHeaders = state.settingsRequestHeaders || null;
   state.lazyThemesArray = state.lazyThemesArray || null;
   if (!state.lazyThemeFetchPending || typeof state.lazyThemeFetchPending !== 'object') {
@@ -4006,13 +4011,21 @@ export function makeEarlyBridgeScript(options = {}) {
   state.isThemeLazy = isThemeLazy;
 
   function makeCachedSettingsSaveResponse(cache, source) {
-    var headers = new Headers(cache.headers || undefined);
-    headers.set('content-type', 'application/json; charset=utf-8');
+    var headers = new Headers((cache && cache.headers) || undefined);
+    if (!headers.has('content-type')) {
+      headers.set('content-type', 'application/json; charset=utf-8');
+    }
     headers.set('x-baibaoku-frontend-save-cache', source || 'hit');
-    headers.set('x-baibaoku-frontend-save-cache-age-ms', String(Date.now() - cache.savedAt));
-    return new Response(cache.text, {
-      status: cache.status || 200,
-      statusText: cache.statusText || 'OK',
+    headers.set('x-baibaoku-frontend-save-cache-age-ms', String(Math.max(0, Date.now() - ((cache && cache.savedAt) || Date.now()))));
+    var status = cache && typeof cache.status === 'number' && cache.status >= 200 && cache.status <= 599
+      ? cache.status
+      : 200;
+    var statusText = cache && typeof cache.statusText === 'string'
+      ? cache.statusText
+      : (status >= 400 ? 'Error' : 'OK');
+    return new Response(cache ? cache.text : '', {
+      status: status,
+      statusText: statusText,
       headers: headers,
     });
   }
@@ -4425,10 +4438,170 @@ export function makeEarlyBridgeScript(options = {}) {
     return rawFetch(input, init);
   }
 
+  function isRouteUnavailableSaveStatus(status) {
+    return status === 404 || status === 405 || status === 501;
+  }
+
+  async function runFallbackSettingsSave(input, init) {
+    try {
+      var fallbackResponse = await callOriginal(input, init);
+      if (fallbackResponse && fallbackResponse.ok) {
+        clearSettingsGetCache('save-fallback');
+      } else {
+        clearSettingsGetCache('save-fallback-error');
+      }
+      return fallbackResponse;
+    } catch (fallbackError) {
+      clearSettingsGetCache('save-fallback-error');
+      throw fallbackError;
+    }
+  }
+
+  async function handleFastSettingsSave(route, input, init, method) {
+    state.requests.save += 1;
+    var saveSeq = (state.settingsSaveSeq = (Number(state.settingsSaveSeq) || 0) + 1);
+    var fastInit;
+    var bodyText;
+
+    try {
+      fastInit = await makeFastInit(input, init, method);
+      rememberSettingsRequestHeaders(fastInit.headers);
+      bodyText = (fastInit.headers && fastInit.headers.has('content-encoding'))
+        ? null
+        : await bodyToText(fastInit.body);
+    } catch (preError) {
+      var preMessage = preError && preError.message ? preError.message : String(preError);
+      state.requests.errors += 1;
+      state.lastError = preMessage;
+      if (state.settingsSaveSeq === saveSeq) {
+        return runFallbackSettingsSave(input, init);
+      }
+      throw preError;
+    }
+
+    if (
+      typeof bodyText === 'string'
+      && state.settingsSavePending
+      && state.settingsSavePending.bodyText === bodyText
+      && state.settingsSavePending.outcomePromise
+    ) {
+      var coalescedEntry = state.settingsSavePending;
+      state.requests.frontendCache += 1;
+      state.requests.saveFrontendCache += 1;
+      coalescedEntry.followerCount += 1;
+      if (saveSeq > coalescedEntry.latestSaveSeq) {
+        coalescedEntry.latestSaveSeq = saveSeq;
+      }
+      var sharedOutcome = await coalescedEntry.outcomePromise;
+      if (sharedOutcome && sharedOutcome.snapshot) {
+        return makeCachedSettingsSaveResponse(sharedOutcome.snapshot, 'pending');
+      }
+      return sharedOutcome && sharedOutcome.response
+        ? sharedOutcome.response.clone()
+        : makeCachedSettingsSaveResponse(null, 'pending');
+    }
+
+    var pendingEntry = null;
+    if (typeof bodyText === 'string') {
+      pendingEntry = {
+        bodyText: bodyText,
+        latestSaveSeq: saveSeq,
+        followerCount: 0,
+        outcomePromise: null,
+      };
+      if (!state.settingsSavePending || saveSeq >= state.settingsSavePending.latestSaveSeq) {
+        state.settingsSavePending = pendingEntry;
+      }
+    } else if (state.settingsSavePending && saveSeq >= state.settingsSavePending.latestSaveSeq) {
+      state.settingsSavePending = null;
+    }
+
+    var detachPendingEntry = function () {
+      if (pendingEntry && state.settingsSavePending === pendingEntry) {
+        state.settingsSavePending = null;
+      }
+    };
+
+    var getEffectiveSeq = function () {
+      return pendingEntry ? pendingEntry.latestSaveSeq : saveSeq;
+    };
+
+    var finalizeResponse = async function (response) {
+      detachPendingEntry();
+      if (pendingEntry && pendingEntry.followerCount > 0 && response && typeof response.clone === 'function') {
+        var snapshot = await snapshotSettingsSaveResponse(response.clone());
+        return { response: response, snapshot: snapshot };
+      }
+      return { response: response, snapshot: null };
+    };
+
+    var executeLeaderSave = async function () {
+      var preparedInit;
+      try {
+        preparedInit = await gzipFastSaveInit(fastInit);
+      } catch (prepError) {
+        var prepMessage = prepError && prepError.message ? prepError.message : String(prepError);
+        state.requests.errors += 1;
+        state.lastError = prepMessage;
+        if (state.settingsSaveSeq === getEffectiveSeq()) {
+          return finalizeResponse(await runFallbackSettingsSave(input, init));
+        }
+        throw prepError;
+      }
+
+      var saveResponse;
+      try {
+        saveResponse = await rawFetch(route.fastPath, preparedInit);
+      } catch (networkError) {
+        var netMessage = networkError && networkError.message ? networkError.message : String(networkError);
+        state.requests.errors += 1;
+        state.lastError = netMessage;
+        state.lastSaveCacheError = netMessage;
+        clearSettingsGetCache('save-network-error');
+        throw networkError;
+      }
+
+      if (saveResponse && saveResponse.ok) {
+        if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
+          clearSettingsGetCache('save');
+        }
+        return finalizeResponse(saveResponse);
+      }
+
+      var status = saveResponse ? saveResponse.status : 0;
+      if (isRouteUnavailableSaveStatus(status)) {
+        if (state.settingsSaveSeq === getEffectiveSeq()) {
+          return finalizeResponse(await runFallbackSettingsSave(input, init));
+        }
+        clearSettingsGetCache('save-superseded');
+        return finalizeResponse(saveResponse);
+      }
+
+      clearSettingsGetCache('save-error');
+      return finalizeResponse(saveResponse);
+    };
+
+    var outcomePromise = executeLeaderSave().finally(detachPendingEntry);
+    if (pendingEntry) {
+      pendingEntry.outcomePromise = outcomePromise;
+    }
+
+    var leaderOutcome = await outcomePromise;
+    return leaderOutcome.response;
+  }
+
   window.fetch = async function baibaokuEarlyFetch(input, init) {
     var url = toUrl(input);
     var method = getMethod(input, init);
     var route = shouldIntercept(url, method);
+
+    if (route && route.kind === 'save') {
+      if (state.settingsAccelerationEnabled !== false) {
+        return handleFastSettingsSave(route, input, init, method);
+      }
+      state.settingsSaveSeq = (Number(state.settingsSaveSeq) || 0) + 1;
+      state.settingsSavePending = null;
+    }
 
     if (!await shouldUseFastRoute(route, input, init)) {
       var originalResponse = await rawFetch(input, init);
@@ -4484,59 +4657,6 @@ export function makeEarlyBridgeScript(options = {}) {
           fastInit.headers.set('x-baibaoku-lazy-themes', '1');
         }
         rememberSettingsRequestHeaders(fastInit.headers);
-      }
-
-      if (route.kind === 'save') {
-        var bodyText = await bodyToText(fastInit.body);
-        if (typeof bodyText === 'string' && state.settingsSavePending && state.settingsSavePending.bodyText === bodyText) {
-          state.requests.frontendCache += 1;
-          state.requests.saveFrontendCache += 1;
-          var pendingSaveSnapshot = await state.settingsSavePending.promise;
-          if (pendingSaveSnapshot && pendingSaveSnapshot.ok) {
-            return makeCachedSettingsSaveResponse(pendingSaveSnapshot, 'pending');
-          }
-          return callOriginal(input, init);
-        }
-
-        var pendingEntry = null;
-        var saveResponsePromise;
-        if (typeof bodyText === 'string') {
-          pendingEntry = { bodyText: bodyText, promise: null };
-          state.settingsSavePending = pendingEntry;
-          saveResponsePromise = (async function () {
-            var preparedInit = await gzipFastSaveInit(fastInit);
-            return rawFetch(route.fastPath, preparedInit);
-          })();
-          pendingEntry.promise = saveResponsePromise
-            .then(function (res) {
-              if (!res || typeof res.clone !== 'function') return null;
-              return snapshotSettingsSaveResponse(res.clone());
-            })
-            .catch(function (error) {
-              state.requests.errors += 1;
-              state.lastSaveCacheError = error && error.message ? error.message : String(error);
-              return null;
-            });
-        } else {
-          fastInit = await gzipFastSaveInit(fastInit);
-          saveResponsePromise = rawFetch(route.fastPath, fastInit);
-        }
-
-        var saveResponse;
-        try {
-          saveResponse = await saveResponsePromise;
-        } finally {
-          if (pendingEntry && state.settingsSavePending === pendingEntry) {
-            state.settingsSavePending = null;
-          }
-        }
-        if (saveResponse && saveResponse.ok) {
-          if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
-            clearSettingsGetCache('save');
-          }
-          return saveResponse;
-        }
-        return callOriginal(input, init);
       }
 
       var response = await rawFetch(route.fastPath, fastInit);
